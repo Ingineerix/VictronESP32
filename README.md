@@ -10,4 +10,4 @@ You will need to grab your Victron Bluetooth Encryption keys from the Victron ph
 
 My system has 3 SmartSolar MPPTs and one BMV, so if yours is different, you'll need to customize the code.
 
-Also, the fixed value for my battery size is coded at line 465, and the scales for the solar and battery power gauges are found in 2 places each; Lines 457, 470, 693, & 716.   Sorry, Too lazy to make defines.
+Also, the fixed value for my battery size is coded at line 450, and the scales for the solar and battery power gauges are found in 2 places each; Lines 442, 455, 675, & 698.   Sorry, Too lazy to make defines!  =)
