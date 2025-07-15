@@ -6,7 +6,7 @@ It includes spiffy analog gauges for inportant metrics and a daily solar product
 
 ![Screenshot](https://github.com/ingineerix/VictronESP32/blob/main/screenshot3.png?raw=true)
 
-You will need to grab your Victron Bluetooth Encryption keys from the Victron phone app (iOS/Android) under "Product Info" and click the "Show" button under "Encryption Data", then add that hex data to the array starting at line 43.
+You will need to grab your Victron Bluetooth Encryption keys from the Victron phone app (iOS/Android) under "Product Info" and click the "Show" button under "Encryption Data", then add that hex data to the array starting at line 54.
 
 My system has 3 SmartSolar MPPTs and one BMV, so if yours is different, you'll need to customize the code.
 
