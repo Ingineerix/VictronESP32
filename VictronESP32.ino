@@ -13,46 +13,59 @@
 
 WiFiClient clientNode;
 WiFiUDP wifiUDPServer;
+Telnet LOG;
 BLEScan *pBLEScan;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
-// Put your local Wifi credentials here
-const char* stssid = "YOUR SSID HERE";
-const char* stkey = "PASSWORD";
-// Used if it can't connect to local network, it will create it's own AP:
+const char* stssid = "<YOUR SSID>";
+const char* stkey = "<YOUR PASS>";
 const char* apssid = "ESP32-Victron";
-const char* apkey = "password";
+const char* apkey = "localnet";
+
+const char* otaPassword = "OTAPASS";
+
+#define BATT_KWH 9.0           // Size of your battery in kWh
+#define BATT_MAX_WATTS 1500    // Max expected battery charge/discharge for analog gauge
+#define SOLAR_MAX_WATTS 1800   // Max Total Wattage you expect to get in most cases
+#define DATA_MINS 840          // 14 hours of data - Needs to be a multiple of 120!
+#define led         2          // GPIO for LED
+
+#define STRING(x) #x
+#define STRINGIFY(x) STRING(x)
 
 // Daily solar data storage - using minutes since first light
-uint16_t dailySolarData[720]; // 12 hours of data (720 minutes)
+uint16_t dailySolarData[DATA_MINS];
 int currentDataIndex = 0;
 unsigned long lastDataSave = 0;
 unsigned long lastMinuteUpdate = 0;
 const unsigned long SAVE_INTERVAL = 60000; // Save every minute
+const unsigned long FLASH_SAVE_INTERVAL = 300000; // Save every 5 minutes (300,000ms)
 const unsigned long MINUTE_INTERVAL = 60000; // Update data every minute
 bool sessionActive = false;
 bool allSolarOff = true;
+bool printData = 0;
 unsigned long sessionStartTime = 0;
+unsigned long lastFlashSave = 0;
+bool dataChangedSinceLastSave = false;
+bool otaInProgress = false;
+bool rebootRequested = false;
 
-// You'll need to grab your own Victron Encryption Keys from the Victron iOS or Android app and supply below
-// My system has 3 MPPTs and one BMV, code will need to be modifed if your setup is different
 const uint8_t keys[4][16] = {
 // LEFT:
-    {0xab, 0xf1, 0x11, 0xd9, 0xcf, 0xab, 0x90, 0x05,
+    {0xba, 0xf1, 0x11, 0xd9, 0xcf, 0xab, 0x90, 0x05,
      0x65, 0x33, 0xe7, 0xdb, 0x9f, 0x15, 0xed, 0xc7},
 // RIGHT:    
-    {0x78, 0x93, 0xc2, 0x38, 0xf1, 0x5b, 0x81, 0x0d,
+    {0x87, 0x93, 0xc2, 0x38, 0xf1, 0x5b, 0x81, 0x0d,
      0xca, 0x0d, 0xda, 0xd7, 0x2c, 0x63, 0x8b, 0x84},
 // REAR:    
-    {0xdf, 0xe3, 0x13, 0xd9, 0x65, 0xa8, 0x79, 0x75,
+    {0xfd, 0xe3, 0x13, 0xd9, 0x65, 0xa8, 0x79, 0x75,
      0xe5, 0x04, 0x53, 0x16, 0x73, 0x07, 0x52, 0x8a},    
 // BMV:
-    {0x32, 0x84, 0x33, 0xa7, 0x66, 0x62, 0xf5, 0xa4,
+    {0x23, 0x84, 0x33, 0xa7, 0x66, 0x62, 0xf5, 0xa4,
      0x42, 0x5c, 0x7c, 0xd2, 0xa9, 0x59, 0xbe, 0xf1},
 };
 
-extern char build[40] = "VictronESP32";
 const char* deviceNames[] = {"LEFT", "RIGHT", "REAR", "BATT"};
 const char* statTxt[] = {"OFF", " 1? ", " 2? ", "BULK", "ABSRB", "FLOAT", " 6? ", "EQLIZ", "INIT"};
 
@@ -393,6 +406,19 @@ const char index_html[] PROGMEM = R"rawliteral(
   </div>
 
   <script>
+    const dataMins = )rawliteral"
+    STRINGIFY(DATA_MINS)
+    R"rawliteral(;
+    const solarMaxWatts = )rawliteral"
+    STRINGIFY(SOLAR_MAX_WATTS)
+    R"rawliteral(;
+    const battMaxWatts = )rawliteral"
+    STRINGIFY(BATT_MAX_WATTS)
+    R"rawliteral(;
+    const batteryKWH = )rawliteral"
+    STRINGIFY(BATT_KWH)
+    R"rawliteral(;
+    
     var gateway = 'ws://' + window.location.host + '/ws';
     var websocket;
     var reconnectInterval = 1000;
@@ -439,7 +465,7 @@ const char index_html[] PROGMEM = R"rawliteral(
           let battPowerValue = parseInt(data.battPower.replace(' W', '')) || 0;
       
           // Update Solar Power Gauge
-          drawGauge(document.getElementById('solarGauge'), solarPower, 0, 1800, 'W', '#00ff88');
+          drawGauge(document.getElementById('solarGauge'), solarPower, 0, solarMaxWatts, 'W', '#00ff88');
           document.getElementById('solarGaugeValue').textContent = solarPower + ' W';
           document.getElementById('solarGaugeToday').textContent = solarToday.toFixed(2) + ' kWh';
       
@@ -447,12 +473,12 @@ const char index_html[] PROGMEM = R"rawliteral(
           let socColor = socValue > 50 ? '#00ff88' : socValue > 20 ? '#ffaa00' : '#ff4444';
           drawGauge(document.getElementById('socGauge'), socValue, 0, 100, '%', socColor);
           document.getElementById('socGaugeValue').textContent = socValue.toFixed(0) + '%';
-          const remainingKwh = (socValue / 100) * 8.9;
+          const remainingKwh = (socValue / 100) * batteryKWH;
           document.getElementById('socGaugeKwh').textContent = remainingKwh.toFixed(2) + ' kWh';
       
           // Update Battery Power Gauge
           let battColor = battPowerValue > 0 ? '#ff6666' : '#66ff66';
-          drawGauge(document.getElementById('batteryGauge'), battPowerValue, -1500, 1500, 'W', battColor, true);
+          drawGauge(document.getElementById('batteryGauge'), battPowerValue, -battMaxWatts, battMaxWatts, 'W', battColor, true);
           document.getElementById('batteryGaugeValue').textContent = battPowerValue.toFixed(0) + ' W';
         })
         .catch(error => {
@@ -461,9 +487,9 @@ const char index_html[] PROGMEM = R"rawliteral(
     }    
 
     function initializeDailyData() {
-      solarData = new Array(720).fill(0); // 12 hours max
+      solarData = new Array(dataMins).fill(0);
       timeLabels = [];
-      for (let i = 0; i < 720; i++) {
+      for (let i = 0; i < dataMins; i++) {
         timeLabels.push(i + 'min');
       }
     }
@@ -500,7 +526,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       
       // Use at least 900 minutes (15 hours) for scale, or actual data range
       const chartRange = Math.max(900, lastDataIndex + 10);
-      const maxPower = Math.max(1800, Math.max(...solarData));
+      const maxPower = Math.max(solarMaxWatts, Math.max(...solarData));
       
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
       ctx.lineWidth = 1;
@@ -663,7 +689,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
     
     function updateGauges(data) {
-      // Solar Power Gauge (in watts, 0-1800W scale)
+      // Solar Power Gauge (in watts)
       let solarPower = 0;
       let solarToday = 0;
       if (data.solar && data.solar.totalPower) {
@@ -672,7 +698,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       if (data.solar && data.solar.totalToday) {
         solarToday = parseFloat(data.solar.totalToday) / 1000; // Convert Wh to kWh
       }
-      drawGauge(document.getElementById('solarGauge'), solarPower, 0, 1800, 'W', '#00ff88');
+      drawGauge(document.getElementById('solarGauge'), solarPower, 0, solarMaxWatts, 'W', '#00ff88');
       document.getElementById('solarGaugeValue').textContent = solarPower + ' W';
       document.getElementById('solarGaugeToday').textContent = solarToday.toFixed(2) + ' kWh';
       
@@ -695,7 +721,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         battPower = parseFloat(data.battery.power);
       }
       let battColor = battPower > 0 ? '#ff6666' : '#66ff66';
-      drawGauge(document.getElementById('batteryGauge'), battPower, -1500, 1500, 'W', battColor, true);
+      drawGauge(document.getElementById('batteryGauge'), battPower, -battMaxWatts, battMaxWatts, 'W', battColor, true);
       document.getElementById('batteryGaugeValue').textContent = battPower.toFixed(0) + ' W';
     }
     
@@ -769,12 +795,12 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
         
         if (data.dailyDataComplete) {
-          solarData = new Array(720).fill(0);
+          solarData = new Array(dataMins).fill(0);
           
           for (let chunk = 0; chunk < dataChunks.length; chunk++) {
             if (dataChunks[chunk]) {
-              const startIndex = chunk * 120; // 120 minutes per chunk for 720 total
-              for (let i = 0; i < dataChunks[chunk].length && (startIndex + i) < 720; i++) {
+              const startIndex = chunk * 120;
+              for (let i = 0; i < dataChunks[chunk].length && (startIndex + i) < dataMins; i++) {
                 solarData[startIndex + i] = dataChunks[chunk][i];
               }
             }
@@ -932,7 +958,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
       Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
       Serial.printf("WebSocket connection established, sending daily data...\n");
       
-      // Send daily data to new client - we'll need to adapt this function
+      // Send daily data to new client
       sendDailySolarDataAsync(client);
       break;
       
@@ -978,14 +1004,14 @@ void handleFavicon(AsyncWebServerRequest *request) {
 void sendDailySolarDataAsync(AsyncWebSocketClient *client) {
   const int chunkSize = 120;
   
-  for (int chunk = 0; chunk < 6; chunk++) {
+  for (int chunk = 0; chunk < 7; chunk++) {
     DynamicJsonDocument doc(2048);
     JsonArray solarArray = doc.createNestedArray("dailyDataChunk");
     doc["chunkIndex"] = chunk;
-    doc["totalChunks"] = 6;
+    doc["totalChunks"] = 7;
     
     int startIndex = chunk * chunkSize;
-    int endIndex = min((chunk + 1) * chunkSize, 720);
+    int endIndex = min((chunk + 1) * chunkSize, DATA_MINS);
     
     for (int i = startIndex; i < endIndex; i++) {
       solarArray.add(dailySolarData[i]);
@@ -1027,7 +1053,7 @@ void initializeDevices() {
   batteryDevice.lastUpdate = 0;
   batteryDevice.valid = false;
   
-  for (int i = 0; i < 720; i++) {
+  for (int i = 0; i < DATA_MINS; i++) {
     dailySolarData[i] = 0;
   }
 }
@@ -1066,9 +1092,37 @@ void saveSessionData() {
     file.write((uint8_t*)&sessionStartTime, sizeof(sessionStartTime));
     file.write((uint8_t*)dailySolarData, sizeof(dailySolarData));
     file.close();
+    
+    dataChangedSinceLastSave = false;
+    lastFlashSave = millis();
+    
+    Serial.println("Session data saved to flash");
   } else {
     Serial.println("Failed to save session data!");
   }
+}
+
+bool shouldSaveToFlash() {
+  unsigned long now = millis();
+  
+  // Check various conditions that trigger a save
+  if (otaInProgress) {
+    Serial.println("OTA in progress - saving before update");
+    return true;
+  }
+  
+  if (rebootRequested) {
+    Serial.println("Reboot requested - saving before restart");
+    return true;
+  }
+  
+  // Regular 5-minute interval save (only if data has changed)
+  if (dataChangedSinceLastSave && (now - lastFlashSave >= FLASH_SAVE_INTERVAL)) {
+    Serial.println("5-minute interval save");
+    return true;
+  }
+  
+  return false;
 }
 
 void updateDailyData(uint16_t totalPower) {
@@ -1096,22 +1150,32 @@ void updateDailyData(uint16_t totalPower) {
     lastMinuteUpdate = now;
     
     // Clear previous session data
-    for (int i = 0; i < 720; i++) {
+    for (int i = 0; i < DATA_MINS; i++) {
       dailySolarData[i] = 0;
     }
+    
+    dataChangedSinceLastSave = true; // Mark that data has changed
   }
   
   if (sessionActive) {
+    // Store previous value to check for changes
+    uint16_t previousValue = (currentDataIndex < DATA_MINS) ? dailySolarData[currentDataIndex] : 0;
+    
     // Update current minute's data
-    if (currentDataIndex < 720) {
-      dailySolarData[currentDataIndex] = max(dailySolarData[currentDataIndex], totalPower);
+    if (currentDataIndex < DATA_MINS) {
+      uint16_t newValue = max(dailySolarData[currentDataIndex], totalPower);
+      if (newValue != previousValue) {
+        dailySolarData[currentDataIndex] = newValue;
+        dataChangedSinceLastSave = true; // Mark that data has changed
+      }
     }
     
     // Check if it's time to move to next minute
     if (now - lastMinuteUpdate >= MINUTE_INTERVAL) {
       lastMinuteUpdate = now;
-      if (currentDataIndex < 719) { // Don't overflow array
+      if (currentDataIndex + 1 < DATA_MINS) { // Don't overflow array
         currentDataIndex++;
+        dataChangedSinceLastSave = true; // New minute means data changed
       }
     }
     
@@ -1119,6 +1183,7 @@ void updateDailyData(uint16_t totalPower) {
     if (allOff && totalPower <= 10) {
       Serial.println("Ending solar session - all panels OFF");
       sessionActive = false;
+      dataChangedSinceLastSave = true; // Session state changed
     }
   }
 }
@@ -1147,27 +1212,25 @@ void updateDisplayAndWebSocket() {
     
     updateDailyData(totalPower);
     
-    if (now - lastDataSave >= SAVE_INTERVAL) {
-      lastDataSave = now;
+    // Check if we should save to flash (replaces the old every-minute save)
+    if (shouldSaveToFlash()) {
       saveSessionData();
     }
-    
-    Serial.println();
-    
-    if (batteryDevice.valid && (now - batteryDevice.lastUpdate < 10000)) {
+        
+    if (printData && batteryDevice.valid) {
       Serial.printf("Battery:          %6.2fV  %6.2fA  %6.0fW  %5.1fAh  %5.1f%%   %s\n",
         batteryDevice.voltage, batteryDevice.current, batteryDevice.power,
         batteryDevice.ampHours, batteryDevice.soc, 
         (batteryDevice.timeToGo == 65535) ? "---" : 
         (batteryDevice.timeToGo >= 1440) ? (String(batteryDevice.timeToGo / 1440.0, 1) + " Days").c_str() :
         (String(batteryDevice.timeToGo / 60) + ":" + (batteryDevice.timeToGo % 60 < 10 ? "0" : "") + String(batteryDevice.timeToGo % 60)).c_str());
+      Serial.printf("Solar Total:      %6dW  %6.0fWh  %s  Session: %s (%dm)\n",
+        totalPower, totalToday, solarStatus.c_str(), 
+        sessionActive ? "Active" : "Inactive", currentDataIndex);
+        printData = 0;
     }
-    
-    Serial.printf("Solar Total:      %6dW  %6.0fWh  %s  Session: %s (%dm)\n",
-      totalPower, totalToday, solarStatus.c_str(), 
-      sessionActive ? "Active" : "Inactive", currentDataIndex);
   }
-  
+    
   if (now - lastWebSocketUpdate >= WEBSOCKET_UPDATE_INTERVAL) {
     lastWebSocketUpdate = now;
     
@@ -1265,6 +1328,8 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
           return;
         }
 
+        digitalWrite(led, 1);
+
         if (advertisedDevice.haveName()) {
           strcpy(savedDeviceName,advertisedDevice.getName().c_str());
         }
@@ -1361,6 +1426,7 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
           batteryDevice.valid = true;
         }
       }
+    digitalWrite(led, 0);
     }
 };
 
@@ -1423,14 +1489,13 @@ void handleDataEndpoint(AsyncWebServerRequest *request) {
 }
   
 void setup() {
+  pinMode(led, OUTPUT);
+  digitalWrite(led, 1);
   Serial.begin(115200);  
   Serial.println();
-  Serial.println(build);
+  Serial.printf("%s - Built %s\n",apssid,__TIMESTAMP__);
   Serial.println();
-  Serial.printf("Source file: %s\n",__FILE__);
-  Serial.printf(" Build time: %s\n",__TIMESTAMP__);
-  Serial.println();
-
+  
   initializeDevices();
   initializeFileSystem();
   // No NTP time setup needed for off-grid operation
@@ -1456,6 +1521,26 @@ void loop() {
     ArduinoOTA.handle();
     Serial.handle();
     
+    while (Serial.available()) {
+        uint8_t gc = Serial.read();
+        if (gc == 1) {  // Did client send CTRL-A [ENTER] (Update)?
+            Serial.println("REBOOTING NOW...");
+            Serial.handle();
+            rebootRequested = true;
+            saveSessionData(); // Save before reboot
+            vTaskDelay(100);
+            Serial.handle();
+            vTaskDelay(100);
+            Serial.handle();
+            vTaskDelay(100);
+            Serial.handle();
+            vTaskDelay(100);
+            ESP.restart();
+        } else if (gc == 13) {
+            printData = 1;
+        }
+    }
+        
     if (wifiMode > 0) {
         if (!isWifiConnected) {
             if (WiFi.isConnected()) {
@@ -1467,6 +1552,7 @@ void loop() {
                 Serial.print("RSSI: ");
                 Serial.println(WiFi.RSSI());
                 needServerInit = true;
+                digitalWrite(led, 0);
             }
             if (wifiMode == 2) {
                 Serial.print("Wifi AP setup as SSID: ");
@@ -1474,6 +1560,7 @@ void loop() {
                 Serial.print("IP address: ");
                 Serial.println(WiFi.softAPIP());
                 needServerInit = true;
+                digitalWrite(led, 0);
             }
             if (needServerInit) {
                 isWifiConnected = true;
@@ -1486,19 +1573,23 @@ void loop() {
                 ws.onEvent(onWsEvent);
                 server.addHandler(&ws);
                 server.begin();
-                
+                                
                 ArduinoOTA.setPort(3232);
-                ArduinoOTA.setHostname("ESP32-Victron");
-                ArduinoOTA.setPassword("OTA-PASSWORD");
+                ArduinoOTA.setHostname(apssid);
+                ArduinoOTA.setPassword(otaPassword);
                 
                 ArduinoOTA.onStart([]() {
+                   otaInProgress = true;
+                   saveSessionData(); // Save before OTA starts
                    String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
                    Serial.println("Start updating " + type);
                 }).onEnd([]() {
+                   otaInProgress = false;
                    Serial.println("\nEnd");
                 }).onProgress([](unsigned int progress, unsigned int total) {
-                    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+                   Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
                 }).onError([](ota_error_t error) {
+                   otaInProgress = false;
                    Serial.printf("Error[%u]: ", error);
                    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
                    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
