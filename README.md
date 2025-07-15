@@ -5,6 +5,7 @@ This is an Ardino ESP32 sketch that uses BLE to connect to Victron SmartSolar MP
 It includes spiffy analog gauges for inportant metrics and a daily solar production graph.
 
 ![Screenshot](https://github.com/ingineerix/VictronESP32/blob/main/screenshot.png?raw=true)
+![Screenshot 2](https://github.com/ingineerix/VictronESP32/blob/main/screenshot2.png?raw=true)
 
 You will need to grab your Victron Bluetooth Encryption keys from the Victron phone app (iOS/Android) under "Product Info" and click the "Show" button under "Encryption Data", then add that hex data to the array starting at line 43.
 
