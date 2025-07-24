@@ -1,6 +1,6 @@
 # VictronESP32
 
-This is an Ardino ESP32 sketch that uses BLE to connect to Victron SmartSolar MPPTs and the Victron BMV (Battery Monitor) to provide a nice dyanmically updating web page.
+This is an Ardino ESP32 sketch that uses BLE to connect to Victron SmartSolar MPPTs and the Victron BMV (Battery Monitor) to provide a nice dynamically updating web page using webSockets.
 
 It includes spiffy analog gauges for inportant metrics and a daily solar production graph.
 
