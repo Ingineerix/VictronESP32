@@ -10,7 +10,6 @@
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
 #include "mbedtls/aes.h"
-#include "Telnet.h"
 
 // WiFi Configuration - Primary and Secondary SSIDs
 const char* stssid = "SSID1";         // Primary WiFi network
