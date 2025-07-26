@@ -21,7 +21,6 @@ const char* apssid = "ESP32-Victron";
 const char* apkey = "PASS";
 
 const char* otaPassword = "PASS";
-
 const char* mpptNames[] = {"left", "right", "rear"};
 const char* deviceNames[] = {"LEFT", "RIGHT", "REAR", "BATT"};
 
@@ -34,6 +33,7 @@ const char* deviceNames[] = {"LEFT", "RIGHT", "REAR", "BATT"};
 extern const char index_html[] PROGMEM;
 WiFiClient clientNode;
 WiFiUDP wifiUDPServer;
+Telnet LOG;
 BLEScan *pBLEScan;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -46,7 +46,6 @@ RTC_DATA_ATTR unsigned long rtc_sessionStartTime = 0;
 RTC_DATA_ATTR uint32_t rtc_dataValid = 0; // Magic number for validation
 RTC_DATA_ATTR unsigned long rtc_lastBootTime = 0;
 RTC_DATA_ATTR bool rtc_newDayDetected = false;
-RTC_DATA_ATTR unsigned long rtc_newDayDetectedTime = 0;
 RTC_DATA_ATTR unsigned long rtc_lastMinuteUpdate = 0;
 
 // Working copies (point to RTC SRAM data)
@@ -55,7 +54,6 @@ bool& sessionActive = rtc_sessionActive;
 int& currentDataIndex = rtc_currentDataIndex;
 unsigned long& sessionStartTime = rtc_sessionStartTime;
 bool& newDayDetected = rtc_newDayDetected;
-unsigned long& newDayDetectedTime = rtc_newDayDetectedTime;
 unsigned long& lastMinuteUpdate = rtc_lastMinuteUpdate;
 
 #define RTC_DATA_MAGIC 0xDEADBEEF
@@ -91,8 +89,6 @@ static unsigned long lowPowerStart = 0;
 // Memory monitoring
 size_t minFreeHeap = SIZE_MAX;
 
-// Grab your Victron Bluetooth Encryption keys from the Victron phone app (iOS/Android)
-// under "Product Info", click the "Show" button under "Encryption Data", then add here:
 const uint8_t keys[4][16] = {
 // LEFT:
     {0xb1, 0xf1, 0x11, 0xd9, 0xcf, 0xab, 0x90, 0x05,
@@ -443,7 +439,6 @@ void checkForNewDay(int deviceIndex, float currentYield) {
       // Mark that we detected a new day
       if (!newDayDetected) {
         newDayDetected = true;
-        newDayDetectedTime = millis();
         Serial.println("NEW DAY: Flagged for reset - waiting for all MPPTs to confirm");
       }
     }
@@ -453,18 +448,12 @@ void checkForNewDay(int deviceIndex, float currentYield) {
   lastTodayYield[deviceIndex] = currentYield;
 }
 
-// New function to check if we should reset for new day:
+// Function to check if we should reset for new day:
 void checkNewDayReset() {
   if (!newDayDetected) return;
   
-  unsigned long now = millis();
-  
-  // Wait 30 seconds after first detection to let all MPPTs reset
-  if (now - newDayDetectedTime < 30000) {
-    return; // Still waiting
-  }
-  
   // Check if ALL MPPTs have reset to 0 (or are at least very low)
+  unsigned long now = millis();
   bool allMpptsReset = true;
   int validMppts = 0;
   
@@ -473,18 +462,17 @@ void checkNewDayReset() {
       validMppts++;
       if (solarDevices[i].todayYield > 10) { // More than 10Wh = probably yesterday's data
         allMpptsReset = false;
-        Serial.printf("MPPT %s still has yield: %.1f Wh\n", deviceNames[i], solarDevices[i].todayYield);
       }
     }
   }
   
   if (validMppts == 0) {
-    Serial.println("NEW DAY RESET: No valid MPPT data - proceeding anyway");
+    Serial.println("NEW DAY RESET: No valid MPPT data from any unit! - proceeding anyway");
     allMpptsReset = true; // If we can't see MPPTs, assume they reset
   }
   
   if (allMpptsReset) {
-    Serial.println("NEW DAY CONFIRMED: All MPPTs have reset - clearing data and rebooting");
+    Serial.printf("NEW DAY CONFIRMED: %d MPPTs have reset - clearing data and rebooting\n", validMppts);
     
     // Clear all session data for new day
     for (int i = 0; i < DATA_MINS; i++) {
@@ -496,7 +484,6 @@ void checkNewDayReset() {
     
     // Clear new day detection flags
     rtc_newDayDetected = false;
-    rtc_newDayDetectedTime = 0;
     
     // Save cleared data to SPIFFS
     saveSessionDataToSPIFFS();
@@ -504,29 +491,6 @@ void checkNewDayReset() {
     Serial.println("NEW DAY: Session data cleared - rebooting for fresh start!");
     delay(1000);
     ESP.restart();
-  } else {
-    // Check for timeout - if we've been waiting too long, force reset anyway
-    if (now - newDayDetectedTime > 300000) { // 5 minutes timeout
-      Serial.println("NEW DAY TIMEOUT: Forcing reset despite some MPPTs not confirming");
-      
-      // Clear all session data for new day
-      for (int i = 0; i < DATA_MINS; i++) {
-        rtc_dailySolarData[i] = 0;
-      }
-      rtc_sessionActive = false;
-      rtc_currentDataIndex = 0;
-      rtc_sessionStartTime = millis();
-      
-      // Clear new day detection flags
-      rtc_newDayDetected = false;
-      rtc_newDayDetectedTime = 0;
-      
-      saveSessionDataToSPIFFS();
-      
-      Serial.println("NEW DAY: Session data cleared - rebooting for fresh start!");
-      delay(1000);
-      ESP.restart();
-    }
   }
 }
 
@@ -1354,7 +1318,9 @@ const char index_html[] PROGMEM = R"rawliteral(
             }
         }
         
+//        const chartRange = Math.max(840, lastDataIndex + 10);
         const chartRange = dataMins;
+//        const maxPower = Math.max(solarMaxWatts, Math.max(...solarData));
         const maxPower = solarMaxWatts;
         
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
@@ -1718,7 +1684,6 @@ void initializeDevices() {
     rtc_lastBootTime = millis();
     rtc_lastMinuteUpdate = millis(); // Initialize minute timer
     rtc_newDayDetected = false;
-    rtc_newDayDetectedTime = 0;
     rtc_dataValid = RTC_DATA_MAGIC;
     
     needsRestore = true;
@@ -1846,8 +1811,8 @@ bool shouldBackupToSPIFFS() {
     }
     
     if (hasSignificantData || sessionActive) {
-      Serial.printf("BACKUP_TRIGGER: Scheduled backup (last backup %lums ago, session=%s)\n", 
-                 now - lastBackupSave, sessionActive ? "active" : "inactive");
+      Serial.printf("BACKUP_TRIGGER: Scheduled backup (last backup %u mins ago, session=%s)\n", 
+                 (now - lastBackupSave)/60000, sessionActive ? "active" : "inactive");
       return true;
     }
   }
@@ -1863,8 +1828,8 @@ void updateDailyData(uint16_t totalPower) {
     if (totalPower < 5) { // Very low power
         if (lowPowerStart == 0) {
             lowPowerStart = now; // Start timing low power period
-        } else if (now - lowPowerStart > 300) { // 5 minutes of low power
-            Serial.println("SESSION END: 5 minutes of low power - ending session");
+        } else if (now - lowPowerStart > 600000) { // 10 minutes of low power
+            Serial.println("SESSION END: 10 minutes of low power - ending session");
             sessionActive = false;
             return; // Don't process data when session ends
         }
