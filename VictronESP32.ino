@@ -597,12 +597,8 @@ void checkForNewDay(int deviceIndex, float currentYield) {
       }
     }
   }
-  
-  // Update the tracked value
   lastTodayYield[deviceIndex] = currentYield;
 }
-
-// Function to check if we should reset for new day:
 
 // Web page HTML
 const char index_html[] PROGMEM = R"rawliteral(
@@ -620,42 +616,41 @@ const char index_html[] PROGMEM = R"rawliteral(
       margin: 0;
       padding: 4px;
       min-height: 100vh;
-      zoom: 0.95; /* Shrink everything by 10% */
+      zoom: 0.95;
     }
     .container {
-      max-width: 1080px; /* Reduced from 1200px */
+      max-width: 1080px;
       margin: 0 auto;
       background: rgba(255, 255, 255, 0.1);
-      border-radius: 11px; /* Slightly smaller */
-      padding: 5px; /* Reduced from 6px */
+      border-radius: 11px;
+      padding: 5px;
       backdrop-filter: blur(10px);
-      box-shadow: 0 7px 29px rgba(0, 0, 0, 0.3); /* Slightly smaller shadow */
+      box-shadow: 0 7px 29px rgba(0, 0, 0, 0.3);
     }
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); /* Reduced from 300px */
-      gap: 4px; /* Reduced from 5px */
-      margin-bottom: 5px; /* Reduced from 6px */
+      grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+      gap: 4px;
+      margin-bottom: 5px;
     }
     .card {
       background: rgba(255, 255, 255, 0.15);
-      border-radius: 11px; /* Slightly smaller */
-      padding: 18px; /* Reduced from 25px */
+      border-radius: 11px;
+      padding: 18px;
       border: 1px solid rgba(255, 255, 255, 0.2);
       backdrop-filter: blur(5px);
-      /* Removed hover transform effect */
     }
     .card h3 {
       margin-top: 0;
-      font-size: 1.26rem; /* Reduced from 1.4rem */
+      font-size: 1.26rem;
       color: #ffd700;
       text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.5);
     }
     .metric {
       display: flex;
       justify-content: space-between;
-      margin: 9px 0; /* Reduced from 10px */
-      font-size: 1rem; /* Reduced from 1.1rem */
+      margin: 9px 0;
+      font-size: 1rem;
     }
     .value {
       font-weight: bold;
@@ -664,8 +659,8 @@ const char index_html[] PROGMEM = R"rawliteral(
     .gauge-container {
       display: flex;
       justify-content: stretch;
-      gap: 5px; /* Reduced from 6px */
-      margin: 3px 0 5px 0; /* Reduced margins */
+      gap: 5px;
+      margin: 3px 0 5px 0;
       flex-wrap: wrap;
     }
     .gauge-wrapper {
@@ -673,8 +668,8 @@ const char index_html[] PROGMEM = R"rawliteral(
       flex-direction: column;
       align-items: center;
       background: rgba(255, 255, 255, 0.1);
-      border-radius: 9px; /* Reduced from 10px */
-      padding: 7px 4px; /* Reduced from 8px 5px */
+      border-radius: 9px;
+      padding: 7px 4px;
       border: 1px solid rgba(255, 255, 255, 0.2);
       backdrop-filter: blur(5px);
       flex: 1 1 0;
@@ -854,7 +849,6 @@ const char index_html[] PROGMEM = R"rawliteral(
   <div class="connection-status" id="connectionStatus">Disconnected</div>
   
   <div class="container">
-    <!-- Gauge Dashboard -->
     <div class="gauge-container">
       <div class="gauge-wrapper">
         <canvas id="solarGauge" width="210" height="210"></canvas>
@@ -875,15 +869,11 @@ const char index_html[] PROGMEM = R"rawliteral(
         <div class="gauge-value" id="batteryTimeToGo">--</div>
       </div>
     </div>
-    
-    <!-- Daily Solar Graph -->
     <div class="graph-container">
       <h3>Daily Solar Production</h3>
       <canvas id="solarChart" width="785" height="205"></canvas>
     </div>
-    
     <div class="grid">
-      
       <div class="card">
         <h3><center>Solar</center></h3>
         <div class="metric">
@@ -976,18 +966,12 @@ const char index_html[] PROGMEM = R"rawliteral(
             this.lastDataTime = Date.now();
             this.connectionCheckTimer = null;
             this.heartbeatInterval = null;
-            
-            // Bind methods to preserve 'this' context
             this.onOpen = this.onOpen.bind(this);
             this.onMessage = this.onMessage.bind(this);
             this.onClose = this.onClose.bind(this);
             this.onError = this.onError.bind(this);
             this.checkConnection = this.checkConnection.bind(this);
-            
-            // Initialize data arrays
             this.initializeDailyData();
-            
-            // Handle page visibility changes
             document.addEventListener('visibilitychange', () => {
                 if (document.hidden) {
                     this.onPageHidden();
@@ -995,19 +979,14 @@ const char index_html[] PROGMEM = R"rawliteral(
                     this.onPageVisible();
                 }
             });
-            
-            // Handle page unload
             window.addEventListener('beforeunload', () => {
                 this.cleanup();
             });
-            
-            // Start connection after a brief delay
             setTimeout(() => {
                 this.connect();
                 this.startConnectionCheck();
             }, 100);
         }
-        
         initializeDailyData() {
             solarData = new Array(dataMins).fill(0);
             dataChunks = new Array(7).fill(null);
@@ -1016,9 +995,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 timeLabels.push(i + 'min');
             }
         }
-        
         connect() {
-            // Clean up any existing connection first
             this.cleanup(false);
             
             if (this.isIntentionallyClosed) {
@@ -1053,11 +1030,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             this.reconnectAttempts = 0;
             this.reconnectInterval = 1000;
             this.lastDataTime = Date.now();
-            
-            // Clear any pending reconnection
             this.clearReconnectTimer();
-            
-            // Update connection status in UI
             this.updateConnectionStatus('Connected');
         }
         
@@ -1066,8 +1039,6 @@ const char index_html[] PROGMEM = R"rawliteral(
             
             try {
                 const data = JSON.parse(event.data);
-                
-                // Check for version changes first
                 if (data.version) {
                     if (currentVersion === null) {
                         currentVersion = data.version;
@@ -1078,8 +1049,6 @@ const char index_html[] PROGMEM = R"rawliteral(
                         return;
                     }
                 }
-                
-                // Handle different message types
                 if (data.dailyDataChunk !== undefined) {
                     this.handleDailyDataChunk(data);
                 } else if (data.dailyDataComplete) {
@@ -1096,14 +1065,8 @@ const char index_html[] PROGMEM = R"rawliteral(
         
         onClose(event) {
             console.log(`WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason}`);
-            
-            // Clean up
             this.ws = null;
-            
-            // Update UI
             this.updateConnectionStatus('Disconnected');
-            
-            // Only reconnect if not intentionally closed
             if (!this.isIntentionallyClosed) {
                 this.scheduleReconnect();
             }
@@ -1111,11 +1074,9 @@ const char index_html[] PROGMEM = R"rawliteral(
         
         onError(event) {
             console.error('WebSocket error', event);
-            // Don't schedule reconnect here - let onClose handle it
         }
         
         scheduleReconnect() {
-            // Clear any existing timer
             this.clearReconnectTimer();
             
             if (this.isIntentionallyClosed) {
@@ -1129,8 +1090,6 @@ const char index_html[] PROGMEM = R"rawliteral(
                 this.updateConnectionStatus('Failed - Too many attempts');
                 return;
             }
-            
-            // Exponential backoff with jitter
             const baseDelay = Math.min(this.reconnectInterval * Math.pow(1.5, this.reconnectAttempts - 1), this.maxReconnectInterval);
             const jitter = Math.random() * 1000;
             const delay = baseDelay + jitter;
@@ -1202,8 +1161,6 @@ const char index_html[] PROGMEM = R"rawliteral(
         
         cleanup(intentional = true) {
             this.isIntentionallyClosed = intentional;
-            
-            // Clear timers
             this.clearReconnectTimer();
             
             if (this.connectionCheckTimer) {
@@ -1215,8 +1172,6 @@ const char index_html[] PROGMEM = R"rawliteral(
                 clearInterval(this.heartbeatInterval);
                 this.heartbeatInterval = null;
             }
-            
-            // Close WebSocket cleanly
             if (this.ws) {
                 this.ws.removeEventListener('open', this.onOpen);
                 this.ws.removeEventListener('message', this.onMessage);
@@ -1254,7 +1209,6 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
         
         handleLiveData(data) {
-            // Handle session status
             if (data.session) {
                 sessionActive = data.session.active;
             }
@@ -1584,8 +1538,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         drawGauge(document.getElementById('batteryGauge'), battPower, -battMaxWatts, battMaxWatts, 'W', battColor, true);
         document.getElementById('batteryGaugeValue').textContent = battPower.toFixed(0) + ' W';
     }
-    
-    // Initialize when page loads
+
     let robustWS = null;
     
     window.addEventListener('load', function() {
@@ -1600,10 +1553,8 @@ const char index_html[] PROGMEM = R"rawliteral(
             return;
         }
         
-        // Initialize the robust WebSocket connection
         robustWS = new RobustWebSocket();
         
-        // Redraw chart every minute
         setInterval(function() {
             drawSolarChart();
         }, 60000);
@@ -1616,13 +1567,11 @@ const char index_html[] PROGMEM = R"rawliteral(
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
   switch(type) {
     case WS_EVT_CONNECT:
-      // Deny new connections during OTA
       if (otaInProgress) {
         client->close(1012, "Service Restarting");
         return;
       }
       
-      // Deny connections if memory is low
       if (ESP.getFreeHeap() < 30000) {
         Serial.printf("Rejecting WebSocket client due to low memory (%d bytes)\r\n", ESP.getFreeHeap());
         client->close(1013, "Low Memory");
@@ -1632,7 +1581,6 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
       Serial.printf("WebSocket client #%u connected from %s (Free heap: %d)\r\n", 
                  client->id(), client->remoteIP().toString().c_str(), ESP.getFreeHeap());
       
-      // Send daily data to new client only if we have good memory
       if (ESP.getFreeHeap() > 30000) {
         sendDailySolarDataAsync(client);
       } else {
@@ -1643,7 +1591,6 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
     case WS_EVT_DISCONNECT:
       Serial.printf("WebSocket client #%u disconnected (Free heap: %d)\r\n", 
                  client->id(), ESP.getFreeHeap());
-      // Force cleanup after disconnect to reclaim memory immediately
       ws.cleanupClients();
       break;
       
@@ -1652,7 +1599,6 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
       break;
       
     case WS_EVT_DATA:
-      // Ignore any data during OTA or low memory
       if (otaInProgress || ESP.getFreeHeap() < 20000) {
         return;
       }
@@ -1664,7 +1610,6 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 }
 
 void handleFavicon(AsyncWebServerRequest *request) {
-  // Use a const string instead of building dynamically to save memory
   static const char svg[] PROGMEM = 
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
     "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 48 48\">"
@@ -1698,7 +1643,6 @@ void sendDailySolarDataAsync(AsyncWebSocketClient *client) {
     static char dataBuffer[2000];  // Fixed size buffer
     
     for (int chunk = 0; chunk < 7; chunk++) {
-        // Build chunk data manually with sprintf
         int pos = snprintf(dataBuffer, sizeof(dataBuffer),
             "{\"dailyDataChunk\":[");
         
@@ -1724,7 +1668,6 @@ void sendDailySolarDataAsync(AsyncWebSocketClient *client) {
         }
     }
     
-    // Send completion message
     if (client && client->canSend()) {
         client->text("{\"dailyDataComplete\":true}");
     }
@@ -1752,7 +1695,6 @@ void initializeDevices() {
     batteryDevice.lastUpdate = 0;
     batteryDevice.valid = false;
     
-    // Initialize session data from SPIFFS or start fresh
     loadSessionDataFromSPIFFS();
 }
 
@@ -1772,7 +1714,6 @@ void saveSessionDataToSPIFFS() {
     sessionData.currentDataIndex = currentDataIndex;
     sessionData.runTime = runTime;
     
-    // Copy the daily data array
     memcpy(sessionData.dailySolarData, dailySolarData, sizeof(dailySolarData));
     
     sessionData.checksum = sessionData.currentDataIndex ^ sessionData.runTime ^ 0xa5;
@@ -1809,7 +1750,6 @@ void loadSessionDataFromSPIFFS() {
     file.readBytes((char*)&sessionData, sizeof(SessionData));
     file.close();
     
-    // Verify checksum
     uint32_t expectedChecksum = sessionData.currentDataIndex ^ sessionData.runTime ^ 0xa5;
     if (sessionData.checksum != expectedChecksum) {
         Serial.println("Corrupted session backup, starting fresh");
@@ -1819,12 +1759,10 @@ void loadSessionDataFromSPIFFS() {
     
     Serial.println("Valid session backup found - restoring data and state");
     
-    // Restore basic session data first
     sessionActive = sessionData.sessionActive;
     newDayDetected = sessionData.newDayDetected;
     currentDataIndex = sessionData.currentDataIndex;
     
-    // Copy the daily data array
     memcpy(dailySolarData, sessionData.dailySolarData, sizeof(dailySolarData));
     
     Serial.printf("Restored session: Active=%s, Index=%d\r\n", sessionActive ? "true" : "false", currentDataIndex);
@@ -1835,7 +1773,6 @@ void loadSessionDataFromSPIFFS() {
 void initializeSessionData() {
     Serial.println("Initializing fresh session data!");
     
-    // Clear all day data
     for (int i = 0; i < DATA_MINS; i++) {
         dailySolarData[i] = 0;
     }
@@ -1853,7 +1790,6 @@ void updateData() {
         return;
     }
 
-    // Take mutex once for entire operation
     if (xSemaphoreTake(deviceDataMutex, 50 / portTICK_PERIOD_MS) != pdTRUE) {
         return;  // Couldn't get lock
     }
@@ -1868,7 +1804,6 @@ void updateData() {
         currentState.battSoc = batteryDevice.soc;
         currentState.battTimeToGo = batteryDevice.timeToGo;
     } else {
-        // Clear battery data if not valid
         currentState.battVoltage = 0;
         currentState.battCurrent = 0;
         currentState.battPower = 0;
@@ -2126,7 +2061,6 @@ void bleScanTask(void *parameter) {
         
         vTaskDelay(100 / portTICK_PERIOD_MS);
         
-        // Yield to watchdog
         yield();
     }
     vTaskDelete(NULL); // Delete this task
@@ -2134,7 +2068,6 @@ void bleScanTask(void *parameter) {
 
 void manageDailySession() {
   if (sessionActive) {
-    // Check if we should end the session
     if (currentState.totalPower < 5) { // Very low power
         lowPowerCount++;
         if (lowPowerCount >= 10) {
@@ -2146,7 +2079,6 @@ void manageDailySession() {
         lowPowerCount = 0; // Reset when power returns
     }
     
-    // Check if we hit the time limit
     if (currentDataIndex >= DATA_MINS - 1) {
         Serial.println("SESSION END: Reached maximum session length!");
         sessionActive = false;
@@ -2210,7 +2142,6 @@ void setup() {
 
     heap_caps_check_integrity_all(true);
     
-    // Initialize file system FIRST
     if (!SPIFFS.begin(true)) {
         Serial.println("SPIFFS Mount Failed!");
     } else {
