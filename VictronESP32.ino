@@ -7,19 +7,19 @@
 #include <BLEAdvertisedDevice.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncWebSocket.h>
-#include <ArduinoJson.h>
 #include <SPIFFS.h>
 #include "mbedtls/aes.h"
 
 // WiFi Configuration - Primary and Secondary SSIDs
-const char* stssid = "SSID1";         // Primary WiFi network
-const char* stkey = "PASS1";          // Primary WiFi password
-const char* stssid2 = "SSID2";        // Secondary WiFi network
-const char* stkey2 = "PASS2";         // Secondary WiFi password
-const char* apssid = "ESP32-Victron";
-const char* apkey = "PASS";
+const char* stssid = "YOUR-SSID";         // Primary WiFi network
+const char* stkey = "PASSWORD";           // Primary WiFi password
+const char* stssid2 = "YOUR-SSID2";       // Secondary WiFi network
+const char* stkey2 = "PASSWORD2";         // Secondary WiFi password
+const char* apssid = "ESP32-Victron";     // SSID for AP if above 2 SSIDs cannot be found
+const char* apkey = "PASSWORD";		      // Password for AP mode
 
-const char* otaPassword = "PASS";
+const char* otaPassword = "PASS";         // OTA Password
+
 const char* mpptNames[] = {"left", "right", "rear"};
 const char* deviceNames[] = {"LEFT", "RIGHT", "REAR", "BATT"};
 
@@ -27,37 +27,67 @@ const char* deviceNames[] = {"LEFT", "RIGHT", "REAR", "BATT"};
 #define BATT_MAX_WATTS 1500    // Max expected battery charge/discharge for analog gauge
 #define SOLAR_MAX_WATTS 2000   // Max Total Wattage you expect to get in most cases
 #define DATA_MINS 840          // 14 hours of data - Needs to be a multiple of 120!
+#define UPDATE_INTERVAL 1000   // 1 second
 #define led         2          // GPIO for LED
+#define button      0          // GPIO for Button
 
 extern const char index_html[] PROGMEM;
 WiFiClient clientNode;
 WiFiUDP wifiUDPServer;
-Telnet LOG;
 BLEScan *pBLEScan;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
-// RTC SRAM storage (survives warm reboots and OTA updates)
-RTC_DATA_ATTR uint16_t rtc_dailySolarData[DATA_MINS];
-RTC_DATA_ATTR bool rtc_sessionActive = false;
-RTC_DATA_ATTR int rtc_currentDataIndex = 0;
-RTC_DATA_ATTR unsigned long rtc_sessionStartTime = 0;
-RTC_DATA_ATTR uint32_t rtc_dataValid = 0; // Magic number for validation
-RTC_DATA_ATTR unsigned long rtc_lastBootTime = 0;
-RTC_DATA_ATTR bool rtc_newDayDetected = false;
-RTC_DATA_ATTR unsigned long rtc_lastMinuteUpdate = 0;
+uint16_t dailySolarData[DATA_MINS];
+bool sessionActive = false;
+bool newDayDetected = false;
+uint16_t currentDataIndex = 0;
+uint16_t runTime = 0;
 
-// Working copies (point to RTC SRAM data)
-uint16_t* dailySolarData = rtc_dailySolarData;
-bool& sessionActive = rtc_sessionActive;
-int& currentDataIndex = rtc_currentDataIndex;
-unsigned long& sessionStartTime = rtc_sessionStartTime;
-bool& newDayDetected = rtc_newDayDetected;
-unsigned long& lastMinuteUpdate = rtc_lastMinuteUpdate;
+// Session data structure for SPIFFS persistence
+struct SessionData {
+    bool sessionActive;                // 1 byte  
+    bool newDayDetected;               // 1 byte
+    uint16_t currentDataIndex;         // 2 bytes
+    uint16_t runTime;                  // 2 bytes
+    uint16_t dailySolarData[DATA_MINS];// 840 * 2 = 1680 bytes
+    uint16_t checksum;                 // 2 bytes
+};                                     // 1688 Total bytes
 
-#define RTC_DATA_MAGIC 0xDEADBEEF
-const unsigned long BACKUP_SAVE_INTERVAL = 3600000; // Backup to SPIFFS every hour (3,600,000ms)
-bool needsRestore = false; // Flag to indicate we need to restore from SPIFFS
+// Global structure to hold current system state
+struct SystemState {
+    // Battery data
+    bool batteryValid;
+    float battVoltage;
+    float battCurrent;
+    float battPower;
+    float battAmpHours;
+    float battSoc;
+    uint16_t battTimeToGo;
+    
+    // MPPT data
+    uint16_t mpptPowers[3];
+    const char* mpptStatuses[3];
+    bool mpptValid[3];
+    
+    // Totals
+    uint16_t totalPower;
+    float totalToday;
+        
+    // Data freshness
+    unsigned long lastUpdate;
+    
+    // Constructor to initialize
+    SystemState() : batteryValid(false), battVoltage(0), battCurrent(0), battPower(0),
+                   battAmpHours(0), battSoc(0), battTimeToGo(0), totalPower(0), 
+                   totalToday(0), lastUpdate(0) {
+        for (int i = 0; i < 3; i++) {
+            mpptPowers[i] = 0;
+            mpptStatuses[i] = "?";
+            mpptValid[i] = false;
+        }
+    }
+};
 
 #define STRING(x) #x
 #define STRINGIFY(x) STRING(x)
@@ -67,23 +97,16 @@ TaskHandle_t bleScanTaskHandle = NULL;
 bool bleDataUpdated = false;
 SemaphoreHandle_t deviceDataMutex = NULL; // For thread-safe access to device data
 
-// Daily solar data storage - now using RTC SRAM
-// (RTC SRAM variables declared above)
-unsigned long lastDataSave = 0;
-unsigned long lastBackupSave = 0;
-const unsigned long SAVE_INTERVAL = 60000; // Save every minute (now just marks data as changed)
-const unsigned long FLASH_SAVE_INTERVAL = 300000; // Legacy - now used for backup triggers
-const unsigned long MINUTE_INTERVAL = 60000; // Update data every minute
 bool allSolarOff = true;
 bool printData = 0;
 bool dataChangedSinceLastSave = false;
 bool dataChangedSinceLastBackup = false;
 bool otaInProgress = false;
-bool rebootRequested = false;
-unsigned long bootTime = 0;
-const unsigned long BOOT_GRACE_PERIOD = 120000; // 2 minutes grace period after boot
+bool otaEnabled = false;
+uint8_t backupTimer = 0;
 static float lastTodayYield[3] = {-1, -1, -1}; // -1 = not initialized
-static unsigned long lowPowerStart = 0;
+static uint8_t lowPowerCount = 0;
+static unsigned long minTimer = 0;
 
 // Memory monitoring
 size_t minFreeHeap = SIZE_MAX;
@@ -145,13 +168,14 @@ const int numWifiNetworks = sizeof(wifiNetworks) / sizeof(wifiNetworks[0]);
 // Storage for device data
 SolarData solarDevices[3]; // LEFT, RIGHT, REAR
 BatteryData batteryDevice;
-unsigned long lastDisplayUpdate = 0;
-unsigned long lastWebSocketUpdate = 0;
-const unsigned long DISPLAY_UPDATE_INTERVAL = 1000; // 1 second
-const unsigned long WEBSOCKET_UPDATE_INTERVAL = 1000; // 1 second
-
+bool batteryValid = false;
+unsigned long lastUpdate = 0;
+float battVoltage = 0, battCurrent = 0, battPower = 0, battAmpHours = 0, battSoc = 0;
+uint16_t battTimeToGo = 0;
+uint16_t mpptPowers[3] = {0, 0, 0};
+const char* mpptStatuses[3] = {"OFF", "OFF", "OFF"};
 uint16_t loopCount = 0;
-int keyBits=128;
+int keyBits = 128;
 int scanTime = 1;
 char savedDeviceName[32];
 boolean needServerInit = false;
@@ -198,6 +222,138 @@ typedef struct {
    uint64_t packed;
 } __attribute__((packed)) victronBattData;
 
+const char* getResetReasonString(esp_reset_reason_t reason) {
+    switch(reason) {
+        case ESP_RST_POWERON: return "Power-on reset";
+        case ESP_RST_EXT: return "External reset";
+        case ESP_RST_SW: return "Software reset";
+        case ESP_RST_PANIC: return "Exception/panic reset";
+        case ESP_RST_INT_WDT: return "Interrupt watchdog reset";
+        case ESP_RST_TASK_WDT: return "Task watchdog reset";
+        case ESP_RST_WDT: return "Other watchdog reset";
+        case ESP_RST_DEEPSLEEP: return "Deep sleep reset";
+        case ESP_RST_BROWNOUT: return "Brown-out reset";
+        case ESP_RST_SDIO: return "SDIO reset";
+        default: return "Unknown reset";
+    }
+}
+
+SystemState currentState;
+
+void reboot() {
+  Serial.println("REBOOTING NOW...");
+  saveSessionDataToSPIFFS();
+            
+  // Stop BLE task before reboot
+  if (bleScanTaskHandle != NULL) {
+    vTaskDelete(bleScanTaskHandle);
+    bleScanTaskHandle = NULL;
+  }
+            
+  vTaskDelay(100 / portTICK_PERIOD_MS);
+  ESP.restart();
+}
+
+// Enhanced memory monitoring
+void checkMemoryHealth() {
+    static unsigned long lastMemCheck = 0;
+    static size_t lastFreeHeap = 0;
+    static uint8_t memoryDropCount = 0;
+    static unsigned long lowMemoryStart = 0;
+    
+    unsigned long now = millis();
+    
+    if (now - lastMemCheck < 5000) return;
+    lastMemCheck = now;
+    
+    size_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < minFreeHeap) {
+        minFreeHeap = freeHeap;
+    }
+
+    if (!heap_caps_check_integrity_all(false)) {
+        Serial.println("############# HEAP CORRUPTION DETECTED!!! #############");
+        reboot();
+    }
+    
+    // Track extended low memory periods
+    if (freeHeap < 20000) {
+        if (lowMemoryStart == 0) {
+            lowMemoryStart = now;
+        } else if (now - lowMemoryStart > 300000) { // 5 minutes of low memory
+            Serial.printf("WARNING: 5+ minutes of low memory condition (current: %d bytes)\r\n", freeHeap);
+        }
+    } else {
+        lowMemoryStart = 0;
+    }
+    
+    // Check for sudden memory drops (possible corruption)
+    if (lastFreeHeap > 0) {
+        int32_t memoryDrop = lastFreeHeap - freeHeap;
+        if (memoryDrop > 10000) { // More than 10KB drop
+            memoryDropCount++;
+            Serial.printf("WARNING: Large memory drop: %d bytes (total drops: %d)\r\n", memoryDrop, memoryDropCount);
+            
+            if (memoryDropCount > 3) {
+                Serial.println("CRITICAL: Multiple large memory drops - possible corruption");
+            }
+        } else if (memoryDrop < -5000) { // Memory suddenly increased (also suspicious)
+            Serial.printf("INFO: Sudden memory increase: %d bytes\r\n", -memoryDrop);
+        }
+    }
+    lastFreeHeap = freeHeap;
+    
+    // Critical memory threshold with pre-crash logging
+    if (freeHeap < 8192) {
+        Serial.printf("CRITICAL: Low memory (%d bytes), forcing reset!\r\n", freeHeap);
+        reboot();
+    }
+    // Warning threshold with cleanup
+    else if (freeHeap < 12288) {
+        Serial.printf("WARNING: Low memory (%d bytes) - cleaning up\r\n", freeHeap);
+        
+        // Aggressive cleanup
+        ws.cleanupClients();
+        
+        // Force garbage collection
+        void* ptr = malloc(1024);
+        if (ptr) free(ptr);
+    }
+}
+
+// BLE task monitoring
+void monitorBLETask() {
+    static unsigned long lastBLECheck = 0;
+    unsigned long now = millis();
+    
+    if (now - lastBLECheck < 60000) return; // Check every minute
+    lastBLECheck = now;
+    
+    if (bleScanTaskHandle) {
+        UBaseType_t stackLeft = uxTaskGetStackHighWaterMark(bleScanTaskHandle);
+        if (stackLeft < 500) {
+            Serial.printf("WARNING: BLE task low on stack (%d bytes left)\r\n", stackLeft);
+        }
+    } else {
+        Serial.println("ERROR: BLE task is dead - attempting restart");
+        
+        // Attempt to restart BLE task
+        BaseType_t taskCreated = xTaskCreatePinnedToCore(
+            bleScanTask,
+            "BLE_Scan_Task",
+            8192,
+            NULL,
+            1,
+            &bleScanTaskHandle,
+            1
+        );
+        
+        if (taskCreated == pdPASS) {
+            Serial.println("BLE task restarted successfully");
+        }
+    }
+}
+
 // Function to scan for available WiFi networks
 void scanForWiFiNetworks() {
   if (wifiScanInProgress) return;
@@ -214,7 +370,7 @@ void scanForWiFiNetworks() {
     return;
   }
   
-  Serial.printf("Found %d networks:\n", n);
+  Serial.printf("Found %d networks:\r\n", n);
   
   int foundNetworkIndex = -1;
   int bestRSSI = -999;
@@ -223,7 +379,7 @@ void scanForWiFiNetworks() {
     String foundSSID = WiFi.SSID(i);
     int rssi = WiFi.RSSI(i);
     
-    Serial.printf("  %d: %s (%d dBm) %s\n", i, foundSSID.c_str(), rssi, 
+    Serial.printf("  %d: %s (%d dBm) %s\r\n", i, foundSSID.c_str(), rssi, 
                WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? " " : "*");
     
     // Check if this is one of our configured networks
@@ -235,7 +391,7 @@ void scanForWiFiNetworks() {
             (j == foundNetworkIndex && rssi > bestRSSI)) { // Same network, better signal
           foundNetworkIndex = j;
           bestRSSI = rssi;
-          Serial.printf("  -> Found configured network: %s (index %d, RSSI: %d)\n", 
+          Serial.printf("  -> Found configured network: %s (index %d, RSSI: %d)\r\n", 
                      wifiNetworks[j].ssid, j, rssi);
         }
       }
@@ -259,7 +415,7 @@ void scanForWiFiNetworks() {
 void connectToWiFi(int networkIndex) {
   if (networkIndex < 0 || networkIndex >= numWifiNetworks) return;
   
-  Serial.printf("Attempting to connect to: %s\n", wifiNetworks[networkIndex].ssid);
+  Serial.printf("Attempting to connect to: %s\r\n", wifiNetworks[networkIndex].ssid);
   
   // If we're currently in AP mode, stop it
   if (apModeActive) {
@@ -304,9 +460,9 @@ void startAPMode() {
     needServerInit = true;
     currentSSIDIndex = -1;
     
-    Serial.printf("AP started successfully\n");
-    Serial.printf("SSID: %s\n", apssid);
-    Serial.printf("IP address: %s\n", WiFi.softAPIP().toString().c_str());
+    Serial.printf("AP started successfully\r\n");
+    Serial.printf("SSID: %s\r\n", apssid);
+    Serial.printf("IP address: %s\r\n", WiFi.softAPIP().toString().c_str());
     
     digitalWrite(led, 0); // Turn off LED to indicate network is ready
   } else {
@@ -316,7 +472,6 @@ void startAPMode() {
 }
 
 void manageWiFi() {
-    static unsigned long lastStateChange = 0;
     static int lastConnectionState = -1; // -1=unknown, 0=disconnected, 1=connected
     unsigned long now = millis();
     
@@ -324,7 +479,6 @@ void manageWiFi() {
     
     // Only process state changes, not continuous checking
     if (currentState != lastConnectionState) {
-        lastStateChange = now;
         lastConnectionState = currentState;
         
         if (currentState == 1 && !isWifiConnected && currentSSIDIndex >= 0) {
@@ -332,16 +486,16 @@ void manageWiFi() {
             isWifiConnected = true;
             needServerInit = true;
             
-            Serial.printf("\nSuccessfully connected to: %s\n", wifiNetworks[currentSSIDIndex].ssid);
-            Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
-            Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+            Serial.printf("\r\nSuccessfully connected to: %s\r\n", wifiNetworks[currentSSIDIndex].ssid);
+            Serial.printf("IP address: %s\r\n", WiFi.localIP().toString().c_str());
+            Serial.printf("RSSI: %d dBm\r\n", WiFi.RSSI());
             
             digitalWrite(led, 0);
             return;
         } else if (currentState == 0 && isWifiConnected && currentSSIDIndex >= 0) {
             // Just disconnected
             digitalWrite(led, 1);
-            Serial.printf("Lost connection to %s\n", wifiNetworks[currentSSIDIndex].ssid);
+            Serial.printf("Lost connection to %s\r\n", wifiNetworks[currentSSIDIndex].ssid);
             isWifiConnected = false;
             currentSSIDIndex = -1;
             
@@ -353,7 +507,7 @@ void manageWiFi() {
     // Handle connection timeout (only check if we're trying to connect)
     if (!WiFi.isConnected() && !apModeActive && currentSSIDIndex >= 0) {
         if (now - wifiConnectStartTime > WIFI_CONNECT_TIMEOUT) {
-            Serial.printf("\nConnection to %s timed out\n", wifiNetworks[currentSSIDIndex].ssid);
+            Serial.printf("\r\nConnection to %s timed out\r\n", wifiNetworks[currentSSIDIndex].ssid);
             currentSSIDIndex = -1;
             scanForWiFiNetworks();
         }
@@ -370,8 +524,42 @@ void setupWiFi() {
   scanForWiFiNetworks();
 }
 
+
+
 void otaProgressCallback(unsigned int progress, unsigned int total) {
    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+}
+
+void enableOTA() {
+    ArduinoOTA.setPort(3232);
+    ArduinoOTA.setHostname(apssid);
+    ArduinoOTA.setPassword(otaPassword);
+    
+    ArduinoOTA.onStart([]() {
+       otaInProgress = true;
+       
+       // Kick off all WebSocket clients before OTA starts
+       Serial.printf("OTA Starting - Disconnecting %d WebSocket clients\r\n", ws.count());
+       server.end();
+       
+       saveSessionDataToSPIFFS(); // Backup before OTA starts
+       String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
+       Serial.println("Start updating " + type);
+    }).onEnd([]() {
+       reboot();
+    }).onProgress(otaProgressCallback)
+    .onError([](ota_error_t error) {
+       Serial.printf("Error[%u]: ", error);
+       if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+       else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+       else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+       else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+       else if (error == OTA_END_ERROR) Serial.println("End Failed");
+       reboot();
+    });
+    ArduinoOTA.begin();
+    otaEnabled = true;
+    Serial.println("OTA Enabled!");
 }
 
 void handleWiFiInLoop() {
@@ -386,43 +574,10 @@ void handleWiFiInLoop() {
       request->send_P(200, "text/html", index_html);
     });
     server.on("/favicon.ico", HTTP_GET, handleFavicon);
-    server.on("/data", HTTP_GET, handleDataEndpoint);
     ws.onEvent(onWsEvent);
     server.addHandler(&ws);
     server.begin();
                     
-    ArduinoOTA.setPort(3232);
-    ArduinoOTA.setHostname(apssid);
-    ArduinoOTA.setPassword(otaPassword);
-    
-    ArduinoOTA.onStart([]() {
-       otaInProgress = true;
-       
-       // Kick off all WebSocket clients before OTA starts
-       Serial.printf("OTA Starting - Disconnecting %d WebSocket clients\n", ws.count());
-       ws.closeAll(1012, "Service Restarting"); // 1012 = Service Restarting
-       ws.cleanupClients(); // Clean up immediately
-       server.end();
-       
-       saveSessionDataToSPIFFS(); // Backup before OTA starts
-       String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
-       Serial.println("Start updating " + type);
-    }).onEnd([]() {
-       otaInProgress = false;
-       Serial.println("\nOTA End - WebSocket connections will be re-enabled");
-    }).onProgress(otaProgressCallback)
-    .onError([](ota_error_t error) {
-       otaInProgress = false; // Re-enable connections on error
-       Serial.printf("Error[%u]: ", error);
-       if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-       else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-       else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-       else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-       else if (error == OTA_END_ERROR) Serial.println("End Failed");
-       Serial.println("WebSocket connections re-enabled after OTA error");
-    });
-    ArduinoOTA.begin();
-    
     needServerInit = false;
   }
 }
@@ -432,7 +587,7 @@ void checkForNewDay(int deviceIndex, float currentYield) {
   if (lastTodayYield[deviceIndex] >= 0) {
     // Detect new day: yield went from non-zero to zero
     if (lastTodayYield[deviceIndex] > 0 && currentYield == 0) {
-      Serial.printf("NEW DAY DETECTED! %s MPPT yield reset: %.1f -> %.1f\n", 
+      Serial.printf("NEW DAY DETECTED! %s MPPT yield reset: %.1f -> %.1f\r\n", 
                  deviceNames[deviceIndex], lastTodayYield[deviceIndex], currentYield);
       
       // Mark that we detected a new day
@@ -448,79 +603,6 @@ void checkForNewDay(int deviceIndex, float currentYield) {
 }
 
 // Function to check if we should reset for new day:
-void checkNewDayReset() {
-  if (!newDayDetected) return;
-  
-  // Check if ALL MPPTs have reset to 0 (or are at least very low)
-  unsigned long now = millis();
-  bool allMpptsReset = true;
-  int validMppts = 0;
-  
-  for (int i = 0; i < 3; i++) {
-    if (solarDevices[i].valid && (now - solarDevices[i].lastUpdate < 30000)) {
-      validMppts++;
-      if (solarDevices[i].todayYield > 10) { // More than 10Wh = probably yesterday's data
-        allMpptsReset = false;
-      }
-    }
-  }
-  
-  if (validMppts == 0) {
-    Serial.println("NEW DAY RESET: No valid MPPT data from any unit! - proceeding anyway");
-    allMpptsReset = true; // If we can't see MPPTs, assume they reset
-  }
-  
-  if (allMpptsReset) {
-    Serial.printf("NEW DAY CONFIRMED: %d MPPTs have reset - clearing data and rebooting\n", validMppts);
-    
-    // Clear all session data for new day
-    for (int i = 0; i < DATA_MINS; i++) {
-      rtc_dailySolarData[i] = 0;
-    }
-    rtc_sessionActive = false;
-    rtc_currentDataIndex = 0;
-    rtc_sessionStartTime = millis();
-    
-    // Clear new day detection flags
-    rtc_newDayDetected = false;
-    
-    // Save cleared data to SPIFFS
-    saveSessionDataToSPIFFS();
-    
-    Serial.println("NEW DAY: Session data cleared - rebooting for fresh start!");
-    delay(1000);
-    ESP.restart();
-  }
-}
-
-// Function to monitor memory and trigger reset if needed
-void checkMemoryHealth() {
-    static unsigned long lastMemCheck = 0;
-    unsigned long now = millis();
-    
-    // Only check every 5 seconds to reduce overhead
-    if (now - lastMemCheck < 5000) return;
-    lastMemCheck = now;
-    
-    size_t freeHeap = ESP.getFreeHeap();
-    if (freeHeap < minFreeHeap) {
-        minFreeHeap = freeHeap;
-    }
-    
-    // Critical memory threshold
-    if (freeHeap < 8192) { // Lowered threshold for earlier warning
-        Serial.printf("CRITICAL: Low memory detected (%d bytes), forcing reset!\n", freeHeap);
-        saveSessionDataToSPIFFS();
-        delay(1000);
-        ESP.restart();
-    }
-    // Warning threshold
-    else if (freeHeap < 12288) {
-        Serial.printf("WARNING: Low memory (%d bytes)\n", freeHeap);
-        // Force garbage collection
-        ws.cleanupClients();
-    }
-}
 
 // Web page HTML
 const char index_html[] PROGMEM = R"rawliteral(
@@ -880,7 +962,6 @@ const char index_html[] PROGMEM = R"rawliteral(
     var timeLabels = [];
     var dataChunks = [];
     var sessionActive = false;
-    var sessionStartTime = 0;
     var currentVersion = null;
     
     class RobustWebSocket {
@@ -1176,9 +1257,6 @@ const char index_html[] PROGMEM = R"rawliteral(
             // Handle session status
             if (data.session) {
                 sessionActive = data.session.active;
-                if (sessionActive && data.session.startTime) {
-                    sessionStartTime = data.session.startTime;
-                }
             }
             
             updateGauges(data);
@@ -1197,6 +1275,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             }
             
             if (data.Mppts) {
+                const todayKwh = (parseFloat(data.solar.totalToday) / 1000).toFixed(2);
                 document.getElementById('leftPower').textContent = data.Mppts.left.power || '--';
                 document.getElementById('leftStatus').textContent = data.Mppts.left.status || '--';
                 document.getElementById('rightPower').textContent = data.Mppts.right.power || '--';
@@ -1209,10 +1288,6 @@ const char index_html[] PROGMEM = R"rawliteral(
                 if (data.Mppts.right && data.Mppts.right.power) totalPower += data.Mppts.right.power;
                 if (data.Mppts.rear && data.Mppts.rear.power) totalPower += data.Mppts.rear.power;
                 document.getElementById('totalPower').textContent = totalPower + ' W';
-            }
-            
-            if (data.solar) {
-                const todayKwh = (parseFloat(data.solar.totalToday) / 1000).toFixed(2);
                 document.getElementById('totalToday').textContent = todayKwh + ' kWh';
                 
                 if (data.session && data.session.currentIndex >= 0) {
@@ -1223,18 +1298,11 @@ const char index_html[] PROGMEM = R"rawliteral(
                 
                 // Update live data in chart
                 if (data.session && data.session.currentIndex >= 0 && data.session.currentIndex < solarData.length) {
-                    let totalPower = 0;
-                    if (data.Mppts) {
-                        if (data.Mppts.left && data.Mppts.left.power) totalPower += data.Mppts.left.power;
-                        if (data.Mppts.right && data.Mppts.right.power) totalPower += data.Mppts.right.power;
-                        if (data.Mppts.rear && data.Mppts.rear.power) totalPower += data.Mppts.rear.power;
-                    }
-                    // Only update if we have meaningful power data
                     if (totalPower > 0) {
                         solarData[data.session.currentIndex] = Math.max(solarData[data.session.currentIndex], totalPower);
                     }
-                }
                 drawSolarChart();
+                }
             }
         }
         
@@ -1317,9 +1385,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             }
         }
         
-//        const chartRange = Math.max(840, lastDataIndex + 10);
         const chartRange = dataMins;
-//        const maxPower = Math.max(solarMaxWatts, Math.max(...solarData));
         const maxPower = solarMaxWatts;
         
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
@@ -1552,18 +1618,33 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
     case WS_EVT_CONNECT:
       // Deny new connections during OTA
       if (otaInProgress) {
-        client->close(1012, "Service Restarting"); // 1012 = Service Restarting code
+        client->close(1012, "Service Restarting");
         return;
       }
       
-      Serial.printf("WebSocket client #%u connected from %s\r\n", client->id(), client->remoteIP().toString().c_str());
+      // Deny connections if memory is low
+      if (ESP.getFreeHeap() < 30000) {
+        Serial.printf("Rejecting WebSocket client due to low memory (%d bytes)\r\n", ESP.getFreeHeap());
+        client->close(1013, "Low Memory");
+        return;
+      }
+            
+      Serial.printf("WebSocket client #%u connected from %s (Free heap: %d)\r\n", 
+                 client->id(), client->remoteIP().toString().c_str(), ESP.getFreeHeap());
       
-      // Send daily data to new client
-      sendDailySolarDataAsync(client);
+      // Send daily data to new client only if we have good memory
+      if (ESP.getFreeHeap() > 30000) {
+        sendDailySolarDataAsync(client);
+      } else {
+        Serial.println("Skipping daily data send due to low memory");
+      }
       break;
       
     case WS_EVT_DISCONNECT:
-      Serial.printf("WebSocket client #%u disconnected\r\n", client->id());
+      Serial.printf("WebSocket client #%u disconnected (Free heap: %d)\r\n", 
+                 client->id(), ESP.getFreeHeap());
+      // Force cleanup after disconnect to reclaim memory immediately
+      ws.cleanupClients();
       break;
       
     case WS_EVT_ERROR:
@@ -1571,8 +1652,8 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
       break;
       
     case WS_EVT_DATA:
-      // Ignore any data during OTA
-      if (otaInProgress) {
+      // Ignore any data during OTA or low memory
+      if (otaInProgress || ESP.getFreeHeap() < 20000) {
         return;
       }
       break;
@@ -1609,100 +1690,70 @@ void sendDailySolarDataAsync(AsyncWebSocketClient *client) {
         return;
     }
     
-    // Pre-allocate string to reduce fragmentation
-    String output;
-    output.reserve(1600); // Estimate size needed
+    if (ESP.getFreeHeap() < 30000) {
+        Serial.printf("Insufficient memory for daily data send (%d bytes)\r\n", ESP.getFreeHeap());
+        return;
+    }
+    
+    static char dataBuffer[2000];  // Fixed size buffer
     
     for (int chunk = 0; chunk < 7; chunk++) {
-        StaticJsonDocument<2000> doc;
-        JsonArray solarArray = doc.createNestedArray("dailyDataChunk");
-        doc["chunkIndex"] = chunk;
-        doc["totalChunks"] = 7;
+        // Build chunk data manually with sprintf
+        int pos = snprintf(dataBuffer, sizeof(dataBuffer),
+            "{\"dailyDataChunk\":[");
         
         int startIndex = chunk * chunkSize;
         int endIndex = min((chunk + 1) * chunkSize, DATA_MINS);
         
-        for (int i = startIndex; i < endIndex; i++) {
-            solarArray.add(dailySolarData[i]);
+        for (int i = startIndex; i < endIndex && pos < sizeof(dataBuffer) - 50; i++) {
+            if (i > startIndex) {
+                pos += snprintf(dataBuffer + pos, sizeof(dataBuffer) - pos, ",");
+            }
+            pos += snprintf(dataBuffer + pos, sizeof(dataBuffer) - pos, "%d", dailySolarData[i]);
         }
         
-        output.clear(); // Reuse string
-        serializeJson(doc, output);
+        snprintf(dataBuffer + pos, sizeof(dataBuffer) - pos,
+            "],\"chunkIndex\":%d,\"totalChunks\":7}", chunk);
 
         if (client->canSend()) {
-            client->text(output);
-            delay(5); // Reduced delay
+            client->text(dataBuffer);
+            delay(10);
         } else {
-            Serial.println("Client disconnected during data send");
-            return;
+            Serial.printf("Skipping chunk %d due to client unavailable\r\n", chunk);
+            break;
         }
     }
     
     // Send completion message
-    if (client->canSend()) {
-        output.clear();
-        output = "{\"dailyDataComplete\":true}"; // Direct string instead of JSON
-        client->text(output);
+    if (client && client->canSend()) {
+        client->text("{\"dailyDataComplete\":true}");
     }
 }
 
 void initializeDevices() {
-  // Record boot time for grace period
-  bootTime = millis();
-  
-  for (int i = 0; i < 3; i++) {
-    solarDevices[i].name = deviceNames[i];
-    solarDevices[i].voltage = 0;
-    solarDevices[i].current = 0;
-    solarDevices[i].power = 0;
-    solarDevices[i].todayYield = 0;
-    solarDevices[i].state = 0;
-    solarDevices[i].lastUpdate = 0;
-    solarDevices[i].valid = false;
-  }
-  
-  batteryDevice.name = "Battery";
-  batteryDevice.voltage = 0;
-  batteryDevice.current = 0;
-  batteryDevice.power = 0;
-  batteryDevice.ampHours = 0;
-  batteryDevice.soc = 0;
-  batteryDevice.timeToGo = 0;
-  batteryDevice.lastUpdate = 0;
-  batteryDevice.valid = false;
-  
-  // Initialize RTC data if invalid (cold boot or first run)
-  if (rtc_dataValid != RTC_DATA_MAGIC) {
-    Serial.println("Initializing RTC SRAM data (cold boot)");
-    for (int i = 0; i < DATA_MINS; i++) {
-      rtc_dailySolarData[i] = 0;
-    }
-    rtc_sessionActive = false;
-    rtc_currentDataIndex = 0;
-    rtc_sessionStartTime = millis();
-    rtc_lastBootTime = millis();
-    rtc_lastMinuteUpdate = millis(); // Initialize minute timer
-    rtc_newDayDetected = false;
-    rtc_dataValid = RTC_DATA_MAGIC;
-    
-    needsRestore = true;
-  } else {
-    Serial.println("RTC SRAM data valid (warm boot/OTA)");
-    rtc_lastBootTime = millis();
-    rtc_lastMinuteUpdate = millis(); // Reset minute timer on reboot
-    
-    Serial.printf("Session: %s, Index: %d\n", 
-               sessionActive ? "Active" : "Inactive", currentDataIndex);
-    
-    if (sessionActive && currentDataIndex > 0) {
-      Serial.printf("Existing session found with %d minutes of data\n", currentDataIndex);
+    for (int i = 0; i < 3; i++) {
+        solarDevices[i].name = deviceNames[i];
+        solarDevices[i].voltage = 0;
+        solarDevices[i].current = 0;
+        solarDevices[i].power = 0;
+        solarDevices[i].todayYield = 0;
+        solarDevices[i].state = 0;
+        solarDevices[i].lastUpdate = 0;
+        solarDevices[i].valid = false;
     }
     
-    // Check if we were in the middle of a new day detection
-    if (newDayDetected) {
-      Serial.printf("New day detection was in progress before reboot - resuming\n");
-    }
-  }
+    batteryDevice.name = "Battery";
+    batteryDevice.voltage = 0;
+    batteryDevice.current = 0;
+    batteryDevice.power = 0;
+    batteryDevice.ampHours = 0;
+    batteryDevice.soc = 0;
+    batteryDevice.timeToGo = 0;
+    batteryDevice.lastUpdate = 0;
+    batteryDevice.valid = false;
+    
+    // Initialize session data from SPIFFS or start fresh
+    loadSessionDataFromSPIFFS();
 }
 
 void initializeFileSystem() {
@@ -1711,324 +1762,221 @@ void initializeFileSystem() {
     return;
   }
   Serial.println("SPIFFS Mounted Successfully");
-  
-  // If this was a cold boot, try to restore from backup
-  if (needsRestore) {
-    loadSessionDataFromSPIFFS();
-    needsRestore = false;
-  }
 }
 
 void saveSessionDataToSPIFFS() {
-  File file = SPIFFS.open("/solarSession.bin", "w");
-  if (file) {
-    // Save only the essential session data to SPIFFS backup
-    file.write((uint8_t*)&rtc_sessionActive, sizeof(rtc_sessionActive));
-    file.write((uint8_t*)&rtc_currentDataIndex, sizeof(rtc_currentDataIndex));
-    file.write((uint8_t*)&rtc_sessionStartTime, sizeof(rtc_sessionStartTime));
-    file.write((uint8_t*)rtc_dailySolarData, sizeof(rtc_dailySolarData));
-    file.write((uint8_t*)&rtc_lastBootTime, sizeof(rtc_lastBootTime));
-    file.write((uint8_t*)&rtc_lastMinuteUpdate, sizeof(rtc_lastMinuteUpdate)); // Add this
+    SessionData sessionData = {0};
     
-    file.close();
+    sessionData.sessionActive = sessionActive;
+    sessionData.newDayDetected = newDayDetected;
+    sessionData.currentDataIndex = currentDataIndex;
+    sessionData.runTime = runTime;
     
-    dataChangedSinceLastBackup = false;
-    lastBackupSave = millis();
-
-    Serial.println("Session data backed up to SPIFFS");
-  } else {
-    Serial.println("Failed to save session backup to SPIFFS!");
-  }
+    // Copy the daily data array
+    memcpy(sessionData.dailySolarData, dailySolarData, sizeof(dailySolarData));
+    
+    sessionData.checksum = sessionData.currentDataIndex ^ sessionData.runTime ^ 0xa5;
+    
+    File file = SPIFFS.open("/solarSession.bin", "w");
+    if (file) {
+        file.write((uint8_t*)&sessionData, sizeof(SessionData));
+        file.flush(); // Force write
+        file.close();
+        
+        Serial.println("Session data saved to SPIFFS");
+        backupTimer = 0;
+    } else {
+        Serial.println("Failed to save session backup to SPIFFS!");
+    }
 }
 
 void loadSessionDataFromSPIFFS() {
-  File file = SPIFFS.open("/solarSession.bin", "r");
-  if (file) {
-    Serial.println("Restoring session data from SPIFFS backup");
-    
-    // Read session data into RTC SRAM
-    file.read((uint8_t*)&rtc_sessionActive, sizeof(rtc_sessionActive));
-    file.read((uint8_t*)&rtc_currentDataIndex, sizeof(rtc_currentDataIndex));
-    file.read((uint8_t*)&rtc_sessionStartTime, sizeof(rtc_sessionStartTime));
-    file.read((uint8_t*)rtc_dailySolarData, sizeof(rtc_dailySolarData));
-    
-    // Try to read newer fields (may not exist in old backups)
-    if (file.available() >= sizeof(rtc_lastBootTime)) {
-      file.read((uint8_t*)&rtc_lastBootTime, sizeof(rtc_lastBootTime));
-    }
-    if (file.available() >= sizeof(rtc_lastMinuteUpdate)) {
-      file.read((uint8_t*)&rtc_lastMinuteUpdate, sizeof(rtc_lastMinuteUpdate));
-    } else {
-      rtc_lastMinuteUpdate = millis(); // Default for old backups
+    File file = SPIFFS.open("/solarSession.bin", "r");
+    if (!file) {
+        Serial.println("No SPIFFS session backup found, starting fresh");
+        initializeSessionData();
+        return;
     }
     
+    if (file.size() != sizeof(SessionData)) {
+        Serial.printf("Invalid session backup size: %d (expected %d)\r\n", file.size(), sizeof(SessionData));
+        file.close();
+        initializeSessionData();
+        return;
+    }
+    
+    SessionData sessionData;
+    file.readBytes((char*)&sessionData, sizeof(SessionData));
     file.close();
     
-    Serial.printf("Restored: Active=%s, Index=%d\n", 
-               sessionActive ? "true" : "false", currentDataIndex);
+    // Verify checksum
+    uint32_t expectedChecksum = sessionData.currentDataIndex ^ sessionData.runTime ^ 0xa5;
+    if (sessionData.checksum != expectedChecksum) {
+        Serial.println("Corrupted session backup, starting fresh");
+        initializeSessionData();
+        return;
+    }
     
-    // Calculate how much existing data we have
-    int dataPoints = 0;
+    Serial.println("Valid session backup found - restoring data and state");
+    
+    // Restore basic session data first
+    sessionActive = sessionData.sessionActive;
+    newDayDetected = sessionData.newDayDetected;
+    currentDataIndex = sessionData.currentDataIndex;
+    
+    // Copy the daily data array
+    memcpy(dailySolarData, sessionData.dailySolarData, sizeof(dailySolarData));
+    
+    Serial.printf("Restored session: Active=%s, Index=%d\r\n", sessionActive ? "true" : "false", currentDataIndex);
+    
+    Serial.printf("Last boot ran for %u minutes!\r\n", sessionData.runTime);
+}
+
+void initializeSessionData() {
+    Serial.println("Initializing fresh session data!");
+    
+    // Clear all day data
     for (int i = 0; i < DATA_MINS; i++) {
-      if (dailySolarData[i] > 0) dataPoints++;
-    }
-    if (dataPoints > 0) {
-      Serial.printf("Restored %d data points from previous session\n", dataPoints);
-    }
-  } else {
-    Serial.println("No SPIFFS backup found, starting fresh");
-  }
-}
-
-bool shouldBackupToSPIFFS() {
-  unsigned long now = millis();
-  static unsigned long lastBackupCheck = 0;
-  
-  // Don't check too frequently
-  if (now - lastBackupCheck < 60000) return false; // Only check once per minute
-  lastBackupCheck = now;
-  
-  // Check various conditions that trigger a backup
-  if (otaInProgress) {
-    Serial.println("BACKUP_TRIGGER: OTA in progress - backing up before update");
-    return true;
-  }
-  
-  if (rebootRequested) {
-    Serial.println("BACKUP_TRIGGER: Reboot requested - backing up before restart");
-    return true;
-  }
-  
-  if (dataChangedSinceLastBackup && (now - lastBackupSave >= BACKUP_SAVE_INTERVAL)) {
-    // Additional check - only backup if we have meaningful data
-    bool hasSignificantData = false;
-    for (int i = 0; i < min(currentDataIndex + 10, DATA_MINS); i++) {
-      if (dailySolarData[i] > 50) { // At least 50W recorded
-        hasSignificantData = true;
-        break;
-      }
+        dailySolarData[i] = 0;
     }
     
-    if (hasSignificantData || sessionActive) {
-      Serial.printf("BACKUP_TRIGGER: Scheduled backup (last backup %u mins ago, session=%s)\n", 
-                 (now - lastBackupSave)/60000, sessionActive ? "active" : "inactive");
-      return true;
-    }
-  }
-  
-  return false;
-}
-
-void updateDailyData(uint16_t totalPower) {
-  unsigned long now = millis();
-
-  if (sessionActive) {
-    // Check if we should end the session
-    if (totalPower < 5) { // Very low power
-        if (lowPowerStart == 0) {
-            lowPowerStart = now; // Start timing low power period
-        } else if (now - lowPowerStart > 600000) { // 10 minutes of low power
-            Serial.println("SESSION END: 10 minutes of low power - ending session");
-            sessionActive = false;
-            return; // Don't process data when session ends
-        }
-    } else {
-        lowPowerStart = 0; // Reset timer when power returns
-    }
-    
-    // Check if we hit the time limit
-    if (currentDataIndex >= DATA_MINS - 1) {
-        Serial.println("SESSION END: Reached maximum session length!");
-        sessionActive = false;
-        return;
-    }
-  }
-  
-  // Session management logic - simplified
-  if (!sessionActive && totalPower > 5) {
-    // Start new session - first light detected
-    Serial.println("Starting new solar session - first light detected");
-    sessionActive = true;
-    sessionStartTime = now;
+    sessionActive = false;
     currentDataIndex = 0;
-    lastMinuteUpdate = now; // Reset minute timer
-    dataChangedSinceLastSave = true;
-    dataChangedSinceLastBackup = true;
-  }
-  
-  if (sessionActive) {
-    // Update current minute's data
-    if (currentDataIndex < DATA_MINS) {
-      uint16_t newValue = max(dailySolarData[currentDataIndex], totalPower);
-      if (newValue != dailySolarData[currentDataIndex]) {
-        dailySolarData[currentDataIndex] = newValue;
-        dataChangedSinceLastSave = true;
-      }
-    }
-  }
-    
-  // Check if a full minute has elapsed - much more reliable than loop counting
-  if (now - lastMinuteUpdate >= 60000) { // 60,000ms = 1 minute
-    lastMinuteUpdate = now;
-    Serial.printf("Memory: Free=%d, Min=%d, WS clients=%d, Loops=%lu, ", ESP.getFreeHeap(), minFreeHeap, ws.count(),loopCount);
-    Serial.printf("Session: %s, Index: %d\n", sessionActive ? "Active" : "Inactive", currentDataIndex);
-    loopCount = 0;
-
-    // Clean up websocket clients more aggressively
-    ws.cleanupClients();
-          
-    // Force garbage collection by triggering a small allocation
-    String dummy;
-    dummy.reserve(100);
-      
-    if (sessionActive && currentDataIndex + 1 < DATA_MINS) {
-      currentDataIndex++;
-      dataChangedSinceLastSave = true;
-    }
-  }
+    newDayDetected = false;
+    currentDataIndex = 0;
 }
 
-void updateDisplayAndWebSocket() {
-    unsigned long now = millis();
+void updateData() {
+    static unsigned long lastUpdateTime = 0;
     
-    if (now - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
-        lastDisplayUpdate = now;
-        
-        uint16_t totalPower = 0;
-        float totalToday = 0;
-        int activeMppts = 0;
-        String solarStatus = "OFF";
-        
-        // Thread-safe device data access for display calculations
-        if (deviceDataMutex != NULL && xSemaphoreTake(deviceDataMutex, 10 / portTICK_PERIOD_MS) == pdTRUE) {
-            // Cache validity checks to avoid repeated calculations
-            bool deviceValid[3];
-            for (int i = 0; i < 3; i++) {
-                deviceValid[i] = solarDevices[i].valid && (now - solarDevices[i].lastUpdate < 10000);
-                if (deviceValid[i]) {
-                    totalPower += solarDevices[i].power;
-                    totalToday += solarDevices[i].todayYield;
-                    activeMppts++;
-                    if (solarDevices[i].state >= 3 && solarDevices[i].state <= 6) {
-                        solarStatus = statTxt[solarDevices[i].state];
-                    }
-                }
-            }
-            xSemaphoreGive(deviceDataMutex);
-        }
-        
-        updateDailyData(totalPower);
-        
-        if (shouldBackupToSPIFFS()) {
-            saveSessionDataToSPIFFS();
-        }
-            
-        if (printData && batteryDevice.valid) {
-            Serial.printf("Battery:          %6.2fV  %6.2fA  %6.0fW  %5.1fAh  %5.1f%%   %dm\n",
-                batteryDevice.voltage, batteryDevice.current, batteryDevice.power,
-                batteryDevice.ampHours, batteryDevice.soc, batteryDevice.timeToGo);
-            Serial.printf("Solar Total:      %6dW  %6.0fWh  %s  Session: %s (%dm)\n",
-                totalPower, totalToday, solarStatus.c_str(), 
-                sessionActive ? "Active" : "Inactive", currentDataIndex);
-            printData = 0;
-        }
+    if (deviceDataMutex == NULL || millis() - lastUpdateTime < UPDATE_INTERVAL) {
+        return;
+    }
+
+    // Take mutex once for entire operation
+    if (xSemaphoreTake(deviceDataMutex, 50 / portTICK_PERIOD_MS) != pdTRUE) {
+        return;  // Couldn't get lock
     }
         
-    // SKIP WebSocket updates completely during OTA
-    if (otaInProgress) {
+    // Collect battery data
+    currentState.batteryValid = batteryDevice.valid && (millis() - batteryDevice.lastUpdate < 10000);
+    if (currentState.batteryValid) {
+        currentState.battVoltage = batteryDevice.voltage;
+        currentState.battCurrent = batteryDevice.current;
+        currentState.battPower = batteryDevice.power;
+        currentState.battAmpHours = batteryDevice.ampHours;
+        currentState.battSoc = batteryDevice.soc;
+        currentState.battTimeToGo = batteryDevice.timeToGo;
+    } else {
+        // Clear battery data if not valid
+        currentState.battVoltage = 0;
+        currentState.battCurrent = 0;
+        currentState.battPower = 0;
+        currentState.battAmpHours = 0;
+        currentState.battSoc = 0;
+        currentState.battTimeToGo = 0;
+    }
+    
+    // Collect MPPT data
+    uint16_t newTotalPower = 0;
+    float newTotalToday = 0;
+    
+    for (int i = 0; i < 3; i++) {
+        currentState.mpptValid[i] = solarDevices[i].valid && (millis() - solarDevices[i].lastUpdate < 10000);
+        
+        if (currentState.mpptValid[i]) {
+            currentState.mpptPowers[i] = solarDevices[i].power;
+            currentState.mpptStatuses[i] = statTxt[solarDevices[i].state];
+            newTotalPower += solarDevices[i].power;
+            newTotalToday += solarDevices[i].todayYield;
+        } else {
+            currentState.mpptPowers[i] = 0;
+            currentState.mpptStatuses[i] = "?";
+        }
+    }
+    
+    currentState.totalPower = newTotalPower;
+    currentState.totalToday = newTotalToday;
+        
+    // Update daily data if session is active
+    if (sessionActive && currentDataIndex < DATA_MINS) {
+        if (dailySolarData[currentDataIndex] < currentState.totalPower) {
+            dailySolarData[currentDataIndex] = currentState.totalPower;
+        }
+    }
+    
+    lastUpdateTime = millis();
+    currentState.lastUpdate = lastUpdateTime;
+    
+    xSemaphoreGive(deviceDataMutex);
+        
+    // Handle console printing
+    if (printData) {
+        Serial.printf("Battery:          %6.2fV  %6.2fA  %6.0fW  %5.1fAh  %5.1f%%   %dm\r\n",
+            currentState.battVoltage, currentState.battCurrent, currentState.battPower,
+            currentState.battAmpHours, currentState.battSoc, currentState.battTimeToGo);
+        Serial.printf("Solar Total:      %6dW  %6.0fWh  %s  Session: %s (%dm)\r\n",
+            currentState.totalPower, currentState.totalToday, currentState.mpptStatuses[0], 
+            sessionActive ? "Active" : "Inactive", currentDataIndex);
+        printData = 0;
+    }
+    
+    // Skip WebSocket if conditions not met
+    if (otaInProgress || ESP.getFreeHeap() < 30000 || ws.count() == 0) {
         return;
     }
     
-    // WebSocket updates with proper mutex handling
-    if (now - lastWebSocketUpdate >= WEBSOCKET_UPDATE_INTERVAL) {
-        lastWebSocketUpdate = now;
-        
-        checkMemoryHealth();
-        
-        // Only send WebSocket data if we have clients and sufficient memory
-        if (ws.count() == 0 || ESP.getFreeHeap() < 15000) {
-            return;
+    // Build version hash
+    static uint32_t versionHash = 0;
+    if (versionHash == 0) {
+        const char* buildTime = __TIMESTAMP__;
+        for (int i = 0; buildTime[i]; i++) {
+            versionHash = versionHash * 31 + buildTime[i];
         }
-        
-        // Pre-calculate commonly used values with thread safety
-        bool batteryValid = false;
-        uint16_t totalPower = 0;
-        float totalToday = 0;
-        
-        // Thread-safe access to all device data
-        if (deviceDataMutex != NULL && xSemaphoreTake(deviceDataMutex, 10 / portTICK_PERIOD_MS) == pdTRUE) {
-            batteryValid = batteryDevice.valid && (now - batteryDevice.lastUpdate < 10000);
-            
-            // Calculate solar totals
-            for (int i = 0; i < 3; i++) {
-                if (solarDevices[i].valid && (now - solarDevices[i].lastUpdate < 10000)) {
-                    totalPower += solarDevices[i].power;
-                    totalToday += solarDevices[i].todayYield;
-                }
-            }
-            xSemaphoreGive(deviceDataMutex);
-        }
-        
-        // Use smaller, more efficient JSON document
-        StaticJsonDocument<500> doc; // Increased slightly for solar data
-        
-        // Build version hash more efficiently
-        static uint32_t versionHash = 0;
-        if (versionHash == 0) { // Calculate once at startup
-            String buildTime = __TIMESTAMP__;
-            for (int i = 0; i < buildTime.length(); i++) {
-                versionHash = versionHash * 31 + buildTime.charAt(i);
-            }
-        }
-        doc["version"] = String(versionHash);
-        
-        // Session information
-        JsonObject session = doc.createNestedObject("session");
-        session["active"] = sessionActive;
-        session["currentIndex"] = currentDataIndex;
-        session["startTime"] = sessionStartTime;
-        
-        // Battery data with thread safety
-        if (batteryValid && deviceDataMutex != NULL && xSemaphoreTake(deviceDataMutex, 5 / portTICK_PERIOD_MS) == pdTRUE) {
-            JsonObject battery = doc.createNestedObject("battery");
-            battery["voltage"] = serialized(String(batteryDevice.voltage, 2));
-            battery["current"] = serialized(String(batteryDevice.current, 2));
-            battery["power"] = serialized(String(batteryDevice.power, 0));
-            battery["ampHours"] = serialized(String(batteryDevice.ampHours, 1));
-            battery["soc"] = serialized(String(batteryDevice.soc, 1));
-            battery["timeToGo"] = batteryDevice.timeToGo;
-            xSemaphoreGive(deviceDataMutex);
-        }
-        
-        // MPPT data with thread safety
-        JsonObject Mppts = doc.createNestedObject("Mppts");
-        
-        if (deviceDataMutex != NULL && xSemaphoreTake(deviceDataMutex, 5 / portTICK_PERIOD_MS) == pdTRUE) {
-            for (int i = 0; i < 3; i++) {
-                JsonObject currentMppt = Mppts.createNestedObject(mpptNames[i]);
-                bool valid = solarDevices[i].valid && (now - solarDevices[i].lastUpdate < 10000);
-                
-                if (valid) {
-                    currentMppt["power"] = solarDevices[i].power;
-                    currentMppt["status"] = statTxt[solarDevices[i].state];
-                } else {
-                    currentMppt["power"] = 0;
-                    currentMppt["status"] = "OFF";
-                }
-            }
-            xSemaphoreGive(deviceDataMutex);
-        }
-        
-        // Solar summary
-        JsonObject solar = doc.createNestedObject("solar");
-        solar["totalToday"] = serialized(String(totalToday, 0)); // Send as Wh, web page converts to kWh
-        
-        // Send efficiently
-        String output;
-        output.reserve(600); // Pre-allocate
-        serializeJson(doc, output);
-        ws.textAll(output);
     }
+    
+    static char wsBuffer[1000];
+    
+    int pos = snprintf(wsBuffer, sizeof(wsBuffer),
+        "{\"version\":%u,"
+        "\"session\":{\"active\":%s,\"currentIndex\":%d}",
+        versionHash,
+        sessionActive ? "true" : "false",
+        currentDataIndex
+    );
+    
+    // Add battery data if valid
+    if (currentState.batteryValid && pos < sizeof(wsBuffer) - 300) {
+        pos += snprintf(wsBuffer + pos, sizeof(wsBuffer) - pos,
+            ",\"battery\":{\"voltage\":\"%.2f\",\"current\":\"%.2f\",\"power\":\"%.0f\","
+            "\"ampHours\":\"%.1f\",\"soc\":\"%.1f\",\"timeToGo\":%d}",
+            currentState.battVoltage, currentState.battCurrent, currentState.battPower, 
+            currentState.battAmpHours, currentState.battSoc, currentState.battTimeToGo
+        );
+    }
+    
+    // Add MPPT data
+    if (pos < sizeof(wsBuffer) - 200) {
+        pos += snprintf(wsBuffer + pos, sizeof(wsBuffer) - pos,
+            ",\"Mppts\":{"
+            "\"left\":{\"power\":%d,\"status\":\"%s\"},"
+            "\"right\":{\"power\":%d,\"status\":\"%s\"},"
+            "\"rear\":{\"power\":%d,\"status\":\"%s\"}"
+            "}",
+            currentState.mpptPowers[0], currentState.mpptStatuses[0],
+            currentState.mpptPowers[1], currentState.mpptStatuses[1],
+            currentState.mpptPowers[2], currentState.mpptStatuses[2]
+        );
+    }
+    
+    // Add solar summary and close JSON
+    if (pos < sizeof(wsBuffer) - 50) {
+        snprintf(wsBuffer + pos, sizeof(wsBuffer) - pos,
+            ",\"solar\":{\"totalToday\":\"%.0f\"}}", currentState.totalToday
+        );
+    }
+
+    ws.textAll(wsBuffer);
 }
 
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
@@ -2037,7 +1985,10 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
       if (advertisedDevice.haveManufacturerData() == true) {
         uint8_t manCharBuf[manDataSizeMax+1];
         std::string manData = advertisedDevice.getManufacturerData();
-        int manDataSize=manData.length();
+        int manDataSize = manData.length();
+        if (manDataSize > manDataSizeMax) {
+          return;  // Skip oversized packets
+        }
         manData.copy((char *)manCharBuf, manDataSize);
         victronManufacturerData * vicData=(victronManufacturerData *)manCharBuf;
         
@@ -2158,69 +2109,6 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
     }
 };
 
-void handleDataEndpoint(AsyncWebServerRequest *request) {
-  unsigned long now = millis();
-  uint16_t totalPower = 0;
-  float totalToday = 0;
-  
-  for (int i = 0; i < 3; i++) {
-    if (solarDevices[i].valid && (now - solarDevices[i].lastUpdate < 10000)) {
-      totalPower += solarDevices[i].power;
-      totalToday += solarDevices[i].todayYield;
-    }
-  }
-  
-  String sessionTimeStr = "--";
-  if (sessionActive && currentDataIndex >= 0) {
-    if (currentDataIndex < 60) {
-      sessionTimeStr = String(currentDataIndex) + "m";
-    } else {
-      int hours = currentDataIndex / 60;
-      int mins = currentDataIndex % 60;
-      sessionTimeStr = String(hours) + "h " + String(mins) + "m";
-    }
-  }
-  
-  // Build response more efficiently to reduce memory fragmentation
-  String response;
-  response.reserve(500); // Pre-allocate to reduce fragmentation
-  response = "{";
-  
-  if (batteryDevice.valid && (now - batteryDevice.lastUpdate < 10000)) {
-    response += "\"battVoltage\":\"" + String(batteryDevice.voltage, 2) + " V\",";
-    response += "\"battCurrent\":\"" + String(batteryDevice.current, 2) + " A\",";
-    response += "\"battPower\":\"" + String(batteryDevice.power, 0) + " W\",";
-    response += "\"battCapacity\":\"" + String(batteryDevice.ampHours, 1) + " Ah\",";
-    response += "\"battSOC\":\"" + String(batteryDevice.soc, 1) + " %\",";
-    
-    // Add individual Mppt data
-    for (int i = 0; i < 3; i++) {
-      String MpptName = (i == 0) ? "left" : (i == 1) ? "right" : "rear";
-      if (solarDevices[i].valid && (now - solarDevices[i].lastUpdate < 10000)) {
-        response += "\"" + MpptName + "Power\":\"" + String(solarDevices[i].power) + "\",";
-        response += "\"" + MpptName + "Status\":\"" + String(statTxt[solarDevices[i].state]) + "\",";
-      } else {
-        response += "\"" + MpptName + "Power\":\"--\",";
-        response += "\"" + MpptName + "Status\":\"--\",";
-      }
-    }
-    
-    response += "\"totalPower\":\"" + String(totalPower) + " W\",";
-    response += "\"totalToday\":\"" + String(totalToday / 1000.0, 2) + " kWh\",";
-    response += "\"sessionTime\":\"" + sessionTimeStr + "\"";
-  } else {
-    response += "\"battVoltage\":\"--\",\"battCurrent\":\"--\",\"battPower\":\"--\",";
-    response += "\"battCapacity\":\"--\",\"battSOC\":\"--\",";
-    response += "\"leftPower\":\"--\",\"leftStatus\":\"--\",";
-    response += "\"rightPower\":\"--\",\"rightStatus\":\"--\",";
-    response += "\"rearPower\":\"--\",\"rearStatus\":\"--\",";
-    response += "\"totalPower\":\"-- W\",\"totalToday\":\"-- kWh\",\"sessionTime\":\"--\"";
-  }
-  response += "}";
-  
-  request->send(200, "application/json", response);
-}
-
 void bleScanTask(void *parameter) {
     while (true) {
         // Check if we should continue scanning
@@ -2236,9 +2124,7 @@ void bleScanTask(void *parameter) {
         // Signal that BLE data might have been updated
         bleDataUpdated = true;
         
-        // Wait before next scan - adjust this based on your needs
-        // 200ms is good for solar data which doesn't change rapidly
-        vTaskDelay(50 / portTICK_PERIOD_MS);
+        vTaskDelay(100 / portTICK_PERIOD_MS);
         
         // Yield to watchdog
         yield();
@@ -2246,20 +2132,96 @@ void bleScanTask(void *parameter) {
     vTaskDelete(NULL); // Delete this task
 }
 
+void manageDailySession() {
+  if (sessionActive) {
+    // Check if we should end the session
+    if (currentState.totalPower < 5) { // Very low power
+        lowPowerCount++;
+        if (lowPowerCount >= 10) {
+            Serial.println("SESSION END: 10 minutes of low power - ending session");
+            sessionActive = false;
+            return; // Don't process data when session ends
+        }
+    } else {
+        lowPowerCount = 0; // Reset when power returns
+    }
+    
+    // Check if we hit the time limit
+    if (currentDataIndex >= DATA_MINS - 1) {
+        Serial.println("SESSION END: Reached maximum session length!");
+        sessionActive = false;
+        return;
+    }
+  }
+  
+  // Session management logic
+  if (!sessionActive && currentState.totalPower > 5) {
+    // Start new session - first light detected
+    Serial.println("Starting new solar session - first light detected");
+    sessionActive = true;
+    currentDataIndex = 0;
+  }
+  
+  if (sessionActive && currentDataIndex + 1 < DATA_MINS) {
+      currentDataIndex++;
+  }
+
+  if (!newDayDetected) return;
+  
+  // Check if ALL MPPTs have reset to 0 (or are at least very low)
+  bool allMpptsReset = true;
+  int validMppts = 0;
+  
+  for (int i = 0; i < 3; i++) {
+    if (solarDevices[i].valid && (millis() - solarDevices[i].lastUpdate < 30000)) {
+      validMppts++;
+      if (solarDevices[i].todayYield > 10) { // More than 10Wh = probably yesterday's data
+        allMpptsReset = false;
+      }
+    }
+  }
+  
+  if (validMppts == 0) {
+    Serial.println("NEW DAY RESET: No valid MPPT data from any unit! - proceeding anyway");
+    allMpptsReset = true; // If we can't see MPPTs, assume they reset
+  }
+  
+  if (allMpptsReset) {
+    Serial.printf("NEW DAY CONFIRMED: %d MPPTs have reset!\r\n", validMppts);
+
+    initializeSessionData();
+
+    reboot();
+  }
+}
+
 void setup() {
     pinMode(led, OUTPUT);
     digitalWrite(led, 1);
+    runTime = 0;
     Serial.begin(115200);  
     Serial.println();
-    Serial.printf("%s - Built %s\n", apssid, __TIMESTAMP__);
+    Serial.printf("%s - Built %s\r\n", apssid, __TIMESTAMP__);
     Serial.println();
+
+    // Get reset reason
+    esp_reset_reason_t resetReason = esp_reset_reason();
+    Serial.printf("Reset reason: %d (%s)\r\n", resetReason, getResetReasonString(resetReason));
+
+    heap_caps_check_integrity_all(true);
+    
+    // Initialize file system FIRST
+    if (!SPIFFS.begin(true)) {
+        Serial.println("SPIFFS Mount Failed!");
+    } else {
+        Serial.println("SPIFFS Mounted Successfully");
+    }
     
     initializeDevices();
-    initializeFileSystem();
     setupWiFi();  
     strcpy(savedDeviceName,"(unknown device name)");
     
-    // Create mutex for thread-safe device data access
+    // Create mutex with error checking
     deviceDataMutex = xSemaphoreCreateMutex();
     if (deviceDataMutex == NULL) {
         Serial.println("ERROR: Failed to create device data mutex!");
@@ -2270,31 +2232,39 @@ void setup() {
     pBLEScan = BLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
     pBLEScan->setActiveScan(true);
-    pBLEScan->setInterval(50);
-    pBLEScan->setWindow(49);
+    pBLEScan->setInterval(100);
+    pBLEScan->setWindow(99);
     
-    // Create BLE scanning task on core 0 (main loop runs on core 1)
+    // Create BLE task with error logging
     BaseType_t taskCreated = xTaskCreatePinnedToCore(
-        bleScanTask,           // Task function
-        "BLE_Scan_Task",       // Task name for debugging
-        4096,                  // Stack size (4KB should be sufficient)
-        NULL,                  // Parameters passed to task
-        1,                     // Priority (1 = low priority, below main loop)
-        &bleScanTaskHandle,    // Task handle for management
-        0                      // Pin to core 0 (core 1 runs main loop)
+        bleScanTask,
+        "BLE_Scan_Task",
+        8192,
+        NULL,
+        1,
+        &bleScanTaskHandle,
+        1
     );
     
     if (taskCreated != pdPASS) {
         Serial.println("✗ ERROR: Failed to create BLE scanning task!");
         bleScanTaskHandle = NULL;
     }
+    
+    Serial.println("Setup complete!");
 }
 
 void loop() {
-    ArduinoOTA.handle();
+    if (otaEnabled) {
+        ArduinoOTA.handle();
+    }
     
     checkMemoryHealth();
-    checkNewDayReset();
+    monitorBLETask();
+
+    if (digitalRead(button) == 0 && otaEnabled == false) {
+	enableOTA();          // Press button to Enable OTA so we can avoid it's memory issues
+    }
     
     // Process console commands
     while (Serial.available()) {
@@ -2302,36 +2272,14 @@ void loop() {
         if (gc == 13) {
             printData = 1;
         } else if (gc == 1) {  // CTRL-A
-            Serial.println("REBOOTING NOW...");
-            rebootRequested = true;
-            saveSessionDataToSPIFFS();
-            
-            // Stop BLE task before reboot
-            if (bleScanTaskHandle != NULL) {
-                vTaskDelete(bleScanTaskHandle);
-                bleScanTaskHandle = NULL;
-            }
-            
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-            ESP.restart();
-        } else if (gc == 2) { // CTRL-B
-            Serial.println("Manually clearing all session data...");
-            for (int i = 0; i < DATA_MINS; i++) {
-               rtc_dailySolarData[i] = 0;
-            }
-            rtc_sessionActive = false;
-            rtc_currentDataIndex = 0;
-            rtc_sessionStartTime = millis();
-            saveSessionDataToSPIFFS();
-            Serial.println("Session data cleared - ready for new day");
-        } else if (gc == 'm') { // Memory status
-            Serial.printf("Free heap: %d bytes, Min free: %d bytes\n", 
-                       ESP.getFreeHeap(), minFreeHeap);
+            reboot();
+        } else if (gc == 'o' && otaEnabled == false) {  // Enable OTA
+            enableOTA();
         } else if (gc == 'w') { // WiFi status
             if (apModeActive) {
-              Serial.printf("WiFi Status: AP Mode - %s\n", WiFi.softAPIP().toString().c_str());
+              Serial.printf("WiFi Status: AP Mode - %s\r\n", WiFi.softAPIP().toString().c_str());
             } else if (WiFi.isConnected()) {
-              Serial.printf("WiFi Status: Connected to %s - %s (RSSI: %d)\n", 
+              Serial.printf("WiFi Status: Connected to %s - %s (RSSI: %d)\r\n", 
                          wifiNetworks[currentSSIDIndex].ssid, 
                          WiFi.localIP().toString().c_str(), WiFi.RSSI());
             } else {
@@ -2340,18 +2288,40 @@ void loop() {
         } else if (gc == 's') { // Force WiFi scan
             Serial.println("Forcing WiFi scan...");
             scanForWiFiNetworks();
-        } else if (gc == 'b') { // BLE task status
-            if (bleScanTaskHandle != NULL) {
-                Serial.printf("BLE Task: Running on core 0, Stack high water: %d bytes\n", 
-                          uxTaskGetStackHighWaterMark(bleScanTaskHandle));
+        } else if (gc == 't') { // BLE task status
+            Serial.printf("Main task stack: %d bytes remaining\r\n", uxTaskGetStackHighWaterMark(NULL));
+            if (bleScanTaskHandle) {
+                Serial.printf("BLE task stack: %d bytes remaining\r\n", uxTaskGetStackHighWaterMark(bleScanTaskHandle));
+                Serial.println("BLE task: Running");
             } else {
-                Serial.println("BLE Task: Not running");
+                Serial.println("BLE task: DEAD");
             }
         }
     }
             
     handleWiFiInLoop();
-    updateDisplayAndWebSocket();
+    updateData();
+    
+    // Tasks to run every minute:
+    if (millis() - minTimer >= 60000) {
+        minTimer = millis();
+
+        runTime++;
+        
+        manageDailySession();
+
+        Serial.printf("Up %u mins - Session: %s, Index: %d, Power: %u W, SoC: %3.0f%% - ", runTime, sessionActive ? "Active" : "Inactive",
+              currentDataIndex, currentState.totalPower, currentState.battSoc);
+        Serial.printf("Memory: Free=%d, Min=%d, WS clients=%d, Loops=%d\r\n", ESP.getFreeHeap(), minFreeHeap, ws.count(), loopCount);
+        loopCount = 0;
+
+        if (sessionActive) {
+            backupTimer++;
+            if (backupTimer >= 5) {
+              saveSessionDataToSPIFFS();
+            }
+        }
+    }
 
     loopCount++;
     
