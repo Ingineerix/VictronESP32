@@ -16,7 +16,7 @@ const char* stkey = "PASSWORD";           // Primary WiFi password
 const char* stssid2 = "YOUR-SSID2";       // Secondary WiFi network
 const char* stkey2 = "PASSWORD2";         // Secondary WiFi password
 const char* apssid = "ESP32-Victron";     // SSID for AP if above 2 SSIDs cannot be found
-const char* apkey = "PASSWORD";		      // Password for AP mode
+const char* apkey = "PASSWORD";		  // Password for AP mode
 
 const char* otaPassword = "PASS";         // OTA Password
 
