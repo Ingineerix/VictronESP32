@@ -23,38 +23,29 @@ const char* otaPassword = "PASS";         // OTA Password
 const char* mpptNames[] = {"left", "right", "rear"};
 const char* deviceNames[] = {"LEFT", "RIGHT", "REAR", "BATT"};
 
-#define BATT_KWH 9.0           // Size of your battery in kWh
+#define BATT_KWH 9.0           // Size of battery in kWh
 #define BATT_MAX_WATTS 1500    // Max expected battery charge/discharge for analog gauge
-#define SOLAR_MAX_WATTS 2000   // Max Total Wattage you expect to get in most cases
+#define SOLAR_MAX_WATTS 2000   // Max Total Solar Wattage you expect to get in most cases
 #define DATA_MINS 840          // 14 hours of data - Needs to be a multiple of 120!
 #define UPDATE_INTERVAL 1000   // 1 second
 #define led         2          // GPIO for LED
 #define button      0          // GPIO for Button
 
-extern const char index_html[] PROGMEM;
 WiFiClient clientNode;
 WiFiUDP wifiUDPServer;
 BLEScan *pBLEScan;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
-uint16_t dailySolarData[DATA_MINS];
-bool sessionActive = false;
-bool newDayDetected = false;
-uint16_t currentDataIndex = 0;
-uint16_t runTime = 0;
-
-// Session data structure for SPIFFS persistence
 struct SessionData {
-    bool sessionActive;                // 1 byte  
-    bool newDayDetected;               // 1 byte
-    uint16_t currentDataIndex;         // 2 bytes
+    bool active;                       // 1 byte  
+    bool newDay;                       // 1 byte
+    uint16_t index;                    // 2 bytes
     uint16_t runTime;                  // 2 bytes
-    uint16_t dailySolarData[DATA_MINS];// 840 * 2 = 1680 bytes
+    uint16_t daily[DATA_MINS];         // 840 * 2 = 1680 bytes
     uint16_t checksum;                 // 2 bytes
 };                                     // 1688 Total bytes
 
-// Global structure to hold current system state
 struct SystemState {
     // Battery data
     bool batteryValid;
@@ -91,25 +82,6 @@ struct SystemState {
 
 #define STRING(x) #x
 #define STRINGIFY(x) STRING(x)
-
-// BLE Task Management
-TaskHandle_t bleScanTaskHandle = NULL;
-bool bleDataUpdated = false;
-SemaphoreHandle_t deviceDataMutex = NULL; // For thread-safe access to device data
-
-bool allSolarOff = true;
-bool printData = 0;
-bool dataChangedSinceLastSave = false;
-bool dataChangedSinceLastBackup = false;
-bool otaInProgress = false;
-bool otaEnabled = false;
-uint8_t backupTimer = 0;
-static float lastTodayYield[3] = {-1, -1, -1}; // -1 = not initialized
-static uint8_t lowPowerCount = 0;
-static unsigned long minTimer = 0;
-
-// Memory monitoring
-size_t minFreeHeap = SIZE_MAX;
 
 const uint8_t keys[4][16] = {
 // LEFT:
@@ -152,47 +124,6 @@ struct BatteryData {
   bool valid;
 };
 
-// WiFi network credentials structure
-struct WiFiNetwork {
-  const char* ssid;
-  const char* password;
-};
-
-WiFiNetwork wifiNetworks[] = {
-  {stssid, stkey},    // Primary network
-  {stssid2, stkey2}   // Secondary network  
-};
-
-const int numWifiNetworks = sizeof(wifiNetworks) / sizeof(wifiNetworks[0]);
-
-// Storage for device data
-SolarData solarDevices[3]; // LEFT, RIGHT, REAR
-BatteryData batteryDevice;
-bool batteryValid = false;
-unsigned long lastUpdate = 0;
-float battVoltage = 0, battCurrent = 0, battPower = 0, battAmpHours = 0, battSoc = 0;
-uint16_t battTimeToGo = 0;
-uint16_t mpptPowers[3] = {0, 0, 0};
-const char* mpptStatuses[3] = {"OFF", "OFF", "OFF"};
-uint16_t loopCount = 0;
-int keyBits = 128;
-int scanTime = 1;
-char savedDeviceName[32];
-boolean needServerInit = false;
-uint8_t cnt = 0;
-uint8_t SSID[32];
-uint8_t WPA2Key[64];
-uint32_t timer;
-int32_t RSSI;
-bool wifiScanInProgress = false;
-unsigned long lastWifiScan = 0;
-const unsigned long WIFI_SCAN_INTERVAL = 30000; // Scan every 30 seconds when in AP mode
-const unsigned long WIFI_CONNECT_TIMEOUT = 15000; // 15 seconds to connect
-unsigned long wifiConnectStartTime = 0;
-int currentSSIDIndex = -1; // -1 = none, 0 = primary, 1 = secondary
-bool apModeActive = false;
-boolean isWifiConnected = false;
-
 typedef struct {
   uint16_t vendorID;
   uint8_t beaconType;
@@ -222,6 +153,28 @@ typedef struct {
    uint64_t packed;
 } __attribute__((packed)) victronBattData;
 
+// WiFi network credentials structure
+struct WiFiNetwork {
+  const char* ssid;
+  const char* password;
+};
+
+WiFiNetwork wifiNetworks[] = {
+  {stssid, stkey},    // Primary network
+  {stssid2, stkey2}   // Secondary network  
+};
+
+TaskHandle_t bleScanTaskHandle = NULL;
+SemaphoreHandle_t deviceDataMutex = NULL; // For thread-safe access to device data
+
+size_t minFreeHeap = SIZE_MAX;
+extern const char index_html[] PROGMEM;
+
+SolarData solarDevices[3]; // LEFT, RIGHT, REAR
+BatteryData batteryDevice;
+SystemState state;
+SessionData session = {0};
+
 const char* getResetReasonString(esp_reset_reason_t reason) {
     switch(reason) {
         case ESP_RST_POWERON: return "Power-on reset";
@@ -238,7 +191,44 @@ const char* getResetReasonString(esp_reset_reason_t reason) {
     }
 }
 
-SystemState currentState;
+const unsigned long WIFI_SCAN_INTERVAL = 30000; // Scan every 30 seconds when in AP mode
+const unsigned long WIFI_CONNECT_TIMEOUT = 15000; // 15 seconds to connect
+const int numWifiNetworks = sizeof(wifiNetworks) / sizeof(wifiNetworks[0]);
+const char* mpptStatuses[3] = {"OFF", "OFF", "OFF"};
+
+static uint8_t lowPowerCount = 0;
+static float lastTodayYield[3] = {-1, -1, -1}; // -1 = not initialized
+static unsigned long minTimer = 0;
+
+bool bleDataUpdated = false;
+bool allSolarOff = true;
+bool printData = 0;
+bool dataChangedSinceLastSave = false;
+bool dataChangedSinceLastBackup = false;
+bool otaInProgress = false;
+bool otaEnabled = false;
+bool needServerInit = false;
+bool batteryValid = false;
+bool wifiScanInProgress = false;
+bool apModeActive = false;
+bool isWifiConnected = false;
+char savedDeviceName[32];
+uint8_t backupTimer = 0;
+uint8_t cnt = 0;
+uint8_t SSID[32];
+uint8_t WPA2Key[64];
+uint16_t battTimeToGo = 0;
+uint16_t mpptPowers[3] = {0, 0, 0};
+uint16_t loopCount = 0;
+uint32_t timer;
+int32_t RSSI;
+int currentSSIDIndex = -1; // -1 = none, 0 = primary, 1 = secondary
+int keyBits = 128;
+int scanTime = 1;
+unsigned long lastWifiScan = 0;
+unsigned long wifiConnectStartTime = 0;
+unsigned long lastUpdate = 0;
+float battVoltage = 0, battCurrent = 0, battPower = 0, battAmpHours = 0, battSoc = 0;
 
 void reboot() {
   Serial.println("REBOOTING NOW...");
@@ -303,7 +293,7 @@ void checkMemoryHealth() {
     }
     lastFreeHeap = freeHeap;
     
-    // Critical memory threshold with pre-crash logging
+    // Critical memory threshold
     if (freeHeap < 8192) {
         Serial.printf("CRITICAL: Low memory (%d bytes), forcing reset!\r\n", freeHeap);
         reboot();
@@ -321,7 +311,6 @@ void checkMemoryHealth() {
     }
 }
 
-// BLE task monitoring
 void monitorBLETask() {
     static unsigned long lastBLECheck = 0;
     unsigned long now = millis();
@@ -354,7 +343,6 @@ void monitorBLETask() {
     }
 }
 
-// Function to scan for available WiFi networks
 void scanForWiFiNetworks() {
   if (wifiScanInProgress) return;
   
@@ -411,7 +399,6 @@ void scanForWiFiNetworks() {
   }
 }
 
-// Function to connect to a specific WiFi network
 void connectToWiFi(int networkIndex) {
   if (networkIndex < 0 || networkIndex >= numWifiNetworks) return;
   
@@ -439,7 +426,6 @@ void connectToWiFi(int networkIndex) {
   isWifiConnected = false;
 }
 
-// Function to start AP mode
 void startAPMode() {
   if (apModeActive) return;
   
@@ -524,8 +510,6 @@ void setupWiFi() {
   scanForWiFiNetworks();
 }
 
-
-
 void otaProgressCallback(unsigned int progress, unsigned int total) {
    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
 }
@@ -587,20 +571,21 @@ void checkForNewDay(int deviceIndex, float currentYield) {
   if (lastTodayYield[deviceIndex] >= 0) {
     // Detect new day: yield went from non-zero to zero
     if (lastTodayYield[deviceIndex] > 0 && currentYield == 0) {
-      Serial.printf("NEW DAY DETECTED! %s MPPT yield reset: %.1f -> %.1f\r\n", 
+      Serial.printf("%s MPPT yield reset: %.1f -> %.1f\r\n", 
                  deviceNames[deviceIndex], lastTodayYield[deviceIndex], currentYield);
       
       // Mark that we detected a new day
-      if (!newDayDetected) {
-        newDayDetected = true;
+      if (!session.newDay) {
+        session.newDay = true;
         Serial.println("NEW DAY: Flagged for reset - waiting for all MPPTs to confirm");
       }
     }
   }
+  
+  // Update the tracked value
   lastTodayYield[deviceIndex] = currentYield;
 }
 
-// Web page HTML
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML>
 <html>
@@ -951,7 +936,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     var solarData = [];
     var timeLabels = [];
     var dataChunks = [];
-    var sessionActive = false;
+    var active = false;
     var currentVersion = null;
     
     class RobustWebSocket {
@@ -966,12 +951,15 @@ const char index_html[] PROGMEM = R"rawliteral(
             this.lastDataTime = Date.now();
             this.connectionCheckTimer = null;
             this.heartbeatInterval = null;
+            
             this.onOpen = this.onOpen.bind(this);
             this.onMessage = this.onMessage.bind(this);
             this.onClose = this.onClose.bind(this);
             this.onError = this.onError.bind(this);
             this.checkConnection = this.checkConnection.bind(this);
+            
             this.initializeDailyData();
+            
             document.addEventListener('visibilitychange', () => {
                 if (document.hidden) {
                     this.onPageHidden();
@@ -979,14 +967,17 @@ const char index_html[] PROGMEM = R"rawliteral(
                     this.onPageVisible();
                 }
             });
+            
             window.addEventListener('beforeunload', () => {
                 this.cleanup();
             });
+            
             setTimeout(() => {
                 this.connect();
                 this.startConnectionCheck();
             }, 100);
         }
+        
         initializeDailyData() {
             solarData = new Array(dataMins).fill(0);
             dataChunks = new Array(7).fill(null);
@@ -995,6 +986,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 timeLabels.push(i + 'min');
             }
         }
+        
         connect() {
             this.cleanup(false);
             
@@ -1013,7 +1005,6 @@ const char index_html[] PROGMEM = R"rawliteral(
                 console.log(`Attempting WebSocket connection (attempt ${this.reconnectAttempts + 1})`);
                 this.ws = new WebSocket(`ws://${window.location.hostname}/ws`);
                 
-                // Attach event listeners
                 this.ws.addEventListener('open', this.onOpen);
                 this.ws.addEventListener('message', this.onMessage);
                 this.ws.addEventListener('close', this.onClose);
@@ -1030,7 +1021,9 @@ const char index_html[] PROGMEM = R"rawliteral(
             this.reconnectAttempts = 0;
             this.reconnectInterval = 1000;
             this.lastDataTime = Date.now();
+            
             this.clearReconnectTimer();
+            
             this.updateConnectionStatus('Connected');
         }
         
@@ -1049,6 +1042,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                         return;
                     }
                 }
+                
                 if (data.dailyDataChunk !== undefined) {
                     this.handleDailyDataChunk(data);
                 } else if (data.dailyDataComplete) {
@@ -1064,7 +1058,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
         
         onClose(event) {
-            console.log(`WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason}`);
+            console.log(`WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason}`);            
             this.ws = null;
             this.updateConnectionStatus('Disconnected');
             if (!this.isIntentionallyClosed) {
@@ -1090,6 +1084,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 this.updateConnectionStatus('Failed - Too many attempts');
                 return;
             }
+            
             const baseDelay = Math.min(this.reconnectInterval * Math.pow(1.5, this.reconnectAttempts - 1), this.maxReconnectInterval);
             const jitter = Math.random() * 1000;
             const delay = baseDelay + jitter;
@@ -1161,6 +1156,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         
         cleanup(intentional = true) {
             this.isIntentionallyClosed = intentional;
+            
             this.clearReconnectTimer();
             
             if (this.connectionCheckTimer) {
@@ -1172,6 +1168,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 clearInterval(this.heartbeatInterval);
                 this.heartbeatInterval = null;
             }
+            
             if (this.ws) {
                 this.ws.removeEventListener('open', this.onOpen);
                 this.ws.removeEventListener('message', this.onMessage);
@@ -1210,7 +1207,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         
         handleLiveData(data) {
             if (data.session) {
-                sessionActive = data.session.active;
+                active = data.session.active;
             }
             
             updateGauges(data);
@@ -1250,7 +1247,6 @@ const char index_html[] PROGMEM = R"rawliteral(
                     document.getElementById('sessionTime').textContent = '--';
                 }
                 
-                // Update live data in chart
                 if (data.session && data.session.currentIndex >= 0 && data.session.currentIndex < solarData.length) {
                     if (totalPower > 0) {
                         solarData[data.session.currentIndex] = Math.max(solarData[data.session.currentIndex], totalPower);
@@ -1280,7 +1276,6 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
     }
     
-    // Utility functions
     function formatTimeToGo(minutes) {
         if (minutes === 65535 || minutes >= 14400) {
             return '&infin;';
@@ -1390,7 +1385,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             ctx.fill();
         }
         
-        if (sessionActive && lastDataIndex > 0) {
+        if (active && lastDataIndex > 0) {
             const currentX = xpadding + (lastDataIndex * chartWidth / chartRange);
             
             ctx.strokeStyle = '#ff6666';
@@ -1538,7 +1533,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         drawGauge(document.getElementById('batteryGauge'), battPower, -battMaxWatts, battMaxWatts, 'W', battColor, true);
         document.getElementById('batteryGaugeValue').textContent = battPower.toFixed(0) + ' W';
     }
-
+    
     let robustWS = null;
     
     window.addEventListener('load', function() {
@@ -1567,11 +1562,13 @@ const char index_html[] PROGMEM = R"rawliteral(
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
   switch(type) {
     case WS_EVT_CONNECT:
+      // Deny new connections during OTA
       if (otaInProgress) {
         client->close(1012, "Service Restarting");
         return;
       }
       
+      // Deny connections if memory is low
       if (ESP.getFreeHeap() < 30000) {
         Serial.printf("Rejecting WebSocket client due to low memory (%d bytes)\r\n", ESP.getFreeHeap());
         client->close(1013, "Low Memory");
@@ -1581,6 +1578,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
       Serial.printf("WebSocket client #%u connected from %s (Free heap: %d)\r\n", 
                  client->id(), client->remoteIP().toString().c_str(), ESP.getFreeHeap());
       
+      // Send daily data to new client only if we have good memory
       if (ESP.getFreeHeap() > 30000) {
         sendDailySolarDataAsync(client);
       } else {
@@ -1591,6 +1589,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
     case WS_EVT_DISCONNECT:
       Serial.printf("WebSocket client #%u disconnected (Free heap: %d)\r\n", 
                  client->id(), ESP.getFreeHeap());
+      // Force cleanup after disconnect to reclaim memory immediately
       ws.cleanupClients();
       break;
       
@@ -1599,6 +1598,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
       break;
       
     case WS_EVT_DATA:
+      // Ignore any data during OTA or low memory
       if (otaInProgress || ESP.getFreeHeap() < 20000) {
         return;
       }
@@ -1640,7 +1640,7 @@ void sendDailySolarDataAsync(AsyncWebSocketClient *client) {
         return;
     }
     
-    static char dataBuffer[2000];  // Fixed size buffer
+    static char dataBuffer[2000];
     
     for (int chunk = 0; chunk < 7; chunk++) {
         int pos = snprintf(dataBuffer, sizeof(dataBuffer),
@@ -1653,7 +1653,7 @@ void sendDailySolarDataAsync(AsyncWebSocketClient *client) {
             if (i > startIndex) {
                 pos += snprintf(dataBuffer + pos, sizeof(dataBuffer) - pos, ",");
             }
-            pos += snprintf(dataBuffer + pos, sizeof(dataBuffer) - pos, "%d", dailySolarData[i]);
+            pos += snprintf(dataBuffer + pos, sizeof(dataBuffer) - pos, "%d", session.daily[i]);
         }
         
         snprintf(dataBuffer + pos, sizeof(dataBuffer) - pos,
@@ -1707,24 +1707,15 @@ void initializeFileSystem() {
 }
 
 void saveSessionDataToSPIFFS() {
-    SessionData sessionData = {0};
-    
-    sessionData.sessionActive = sessionActive;
-    sessionData.newDayDetected = newDayDetected;
-    sessionData.currentDataIndex = currentDataIndex;
-    sessionData.runTime = runTime;
-    
-    memcpy(sessionData.dailySolarData, dailySolarData, sizeof(dailySolarData));
-    
-    sessionData.checksum = sessionData.currentDataIndex ^ sessionData.runTime ^ 0xa5;
+    session.checksum = session.index ^ session.runTime ^ 0xa5;
     
     File file = SPIFFS.open("/solarSession.bin", "w");
     if (file) {
-        file.write((uint8_t*)&sessionData, sizeof(SessionData));
+        file.write((uint8_t*)&session, sizeof(SessionData));
         file.flush(); // Force write
         file.close();
         
-        Serial.println("Session data saved to SPIFFS");
+        Serial.printf("Session Data saved to SPIFFS: Active=%s, Index=%d\r\n", session.active ? "true" : "false", session.index);
         backupTimer = 0;
     } else {
         Serial.println("Failed to save session backup to SPIFFS!");
@@ -1746,41 +1737,32 @@ void loadSessionDataFromSPIFFS() {
         return;
     }
     
-    SessionData sessionData;
-    file.readBytes((char*)&sessionData, sizeof(SessionData));
+    file.readBytes((char*)&session, sizeof(SessionData));
     file.close();
     
-    uint32_t expectedChecksum = sessionData.currentDataIndex ^ sessionData.runTime ^ 0xa5;
-    if (sessionData.checksum != expectedChecksum) {
+    // Verify checksum
+    if (session.checksum != (session.index ^ session.runTime ^ 0xa5)) {
         Serial.println("Corrupted session backup, starting fresh");
         initializeSessionData();
         return;
     }
     
-    Serial.println("Valid session backup found - restoring data and state");
+    Serial.printf("Valid Session Data in SPIFFS Restored: Active=%s, Index=%d\r\n", session.active ? "true" : "false", session.index);
     
-    sessionActive = sessionData.sessionActive;
-    newDayDetected = sessionData.newDayDetected;
-    currentDataIndex = sessionData.currentDataIndex;
-    
-    memcpy(dailySolarData, sessionData.dailySolarData, sizeof(dailySolarData));
-    
-    Serial.printf("Restored session: Active=%s, Index=%d\r\n", sessionActive ? "true" : "false", currentDataIndex);
-    
-    Serial.printf("Last boot ran for %u minutes!\r\n", sessionData.runTime);
+    Serial.printf("Last boot ran for %u minutes!\r\n", session.runTime);
 }
 
 void initializeSessionData() {
     Serial.println("Initializing fresh session data!");
     
+    // Clear all day data
     for (int i = 0; i < DATA_MINS; i++) {
-        dailySolarData[i] = 0;
+        session.daily[i] = 0;
     }
     
-    sessionActive = false;
-    currentDataIndex = 0;
-    newDayDetected = false;
-    currentDataIndex = 0;
+    session.active = false;
+    session.index = 0;
+    session.newDay = false;
 }
 
 void updateData() {
@@ -1790,26 +1772,28 @@ void updateData() {
         return;
     }
 
+    // Take mutex once for entire operation
     if (xSemaphoreTake(deviceDataMutex, 50 / portTICK_PERIOD_MS) != pdTRUE) {
         return;  // Couldn't get lock
     }
         
     // Collect battery data
-    currentState.batteryValid = batteryDevice.valid && (millis() - batteryDevice.lastUpdate < 10000);
-    if (currentState.batteryValid) {
-        currentState.battVoltage = batteryDevice.voltage;
-        currentState.battCurrent = batteryDevice.current;
-        currentState.battPower = batteryDevice.power;
-        currentState.battAmpHours = batteryDevice.ampHours;
-        currentState.battSoc = batteryDevice.soc;
-        currentState.battTimeToGo = batteryDevice.timeToGo;
+    state.batteryValid = batteryDevice.valid && (millis() - batteryDevice.lastUpdate < 10000);
+    if (state.batteryValid) {
+        state.battVoltage = batteryDevice.voltage;
+        state.battCurrent = batteryDevice.current;
+        state.battPower = batteryDevice.power;
+        state.battAmpHours = batteryDevice.ampHours;
+        state.battSoc = batteryDevice.soc;
+        state.battTimeToGo = batteryDevice.timeToGo;
     } else {
-        currentState.battVoltage = 0;
-        currentState.battCurrent = 0;
-        currentState.battPower = 0;
-        currentState.battAmpHours = 0;
-        currentState.battSoc = 0;
-        currentState.battTimeToGo = 0;
+        // Clear battery data if not valid
+        state.battVoltage = 0;
+        state.battCurrent = 0;
+        state.battPower = 0;
+        state.battAmpHours = 0;
+        state.battSoc = 0;
+        state.battTimeToGo = 0;
     }
     
     // Collect MPPT data
@@ -1817,42 +1801,42 @@ void updateData() {
     float newTotalToday = 0;
     
     for (int i = 0; i < 3; i++) {
-        currentState.mpptValid[i] = solarDevices[i].valid && (millis() - solarDevices[i].lastUpdate < 10000);
+        state.mpptValid[i] = solarDevices[i].valid && (millis() - solarDevices[i].lastUpdate < 10000);
         
-        if (currentState.mpptValid[i]) {
-            currentState.mpptPowers[i] = solarDevices[i].power;
-            currentState.mpptStatuses[i] = statTxt[solarDevices[i].state];
+        if (state.mpptValid[i]) {
+            state.mpptPowers[i] = solarDevices[i].power;
+            state.mpptStatuses[i] = statTxt[solarDevices[i].state];
             newTotalPower += solarDevices[i].power;
             newTotalToday += solarDevices[i].todayYield;
         } else {
-            currentState.mpptPowers[i] = 0;
-            currentState.mpptStatuses[i] = "?";
+            state.mpptPowers[i] = 0;
+            state.mpptStatuses[i] = "?";
         }
     }
     
-    currentState.totalPower = newTotalPower;
-    currentState.totalToday = newTotalToday;
+    state.totalPower = newTotalPower;
+    state.totalToday = newTotalToday;
         
     // Update daily data if session is active
-    if (sessionActive && currentDataIndex < DATA_MINS) {
-        if (dailySolarData[currentDataIndex] < currentState.totalPower) {
-            dailySolarData[currentDataIndex] = currentState.totalPower;
+    if (session.active && session.index < DATA_MINS) {
+        if (session.daily[session.index] < state.totalPower) {
+            session.daily[session.index] = state.totalPower;
         }
     }
     
     lastUpdateTime = millis();
-    currentState.lastUpdate = lastUpdateTime;
+    state.lastUpdate = lastUpdateTime;
     
     xSemaphoreGive(deviceDataMutex);
         
     // Handle console printing
     if (printData) {
         Serial.printf("Battery:          %6.2fV  %6.2fA  %6.0fW  %5.1fAh  %5.1f%%   %dm\r\n",
-            currentState.battVoltage, currentState.battCurrent, currentState.battPower,
-            currentState.battAmpHours, currentState.battSoc, currentState.battTimeToGo);
+            state.battVoltage, state.battCurrent, state.battPower,
+            state.battAmpHours, state.battSoc, state.battTimeToGo);
         Serial.printf("Solar Total:      %6dW  %6.0fWh  %s  Session: %s (%dm)\r\n",
-            currentState.totalPower, currentState.totalToday, currentState.mpptStatuses[0], 
-            sessionActive ? "Active" : "Inactive", currentDataIndex);
+            state.totalPower, state.totalToday, state.mpptStatuses[0], 
+            session.active ? "Active" : "Inactive", session.index);
         printData = 0;
     }
     
@@ -1876,17 +1860,17 @@ void updateData() {
         "{\"version\":%u,"
         "\"session\":{\"active\":%s,\"currentIndex\":%d}",
         versionHash,
-        sessionActive ? "true" : "false",
-        currentDataIndex
+        session.active ? "true" : "false",
+        session.index
     );
     
     // Add battery data if valid
-    if (currentState.batteryValid && pos < sizeof(wsBuffer) - 300) {
+    if (state.batteryValid && pos < sizeof(wsBuffer) - 300) {
         pos += snprintf(wsBuffer + pos, sizeof(wsBuffer) - pos,
             ",\"battery\":{\"voltage\":\"%.2f\",\"current\":\"%.2f\",\"power\":\"%.0f\","
             "\"ampHours\":\"%.1f\",\"soc\":\"%.1f\",\"timeToGo\":%d}",
-            currentState.battVoltage, currentState.battCurrent, currentState.battPower, 
-            currentState.battAmpHours, currentState.battSoc, currentState.battTimeToGo
+            state.battVoltage, state.battCurrent, state.battPower, 
+            state.battAmpHours, state.battSoc, state.battTimeToGo
         );
     }
     
@@ -1898,16 +1882,16 @@ void updateData() {
             "\"right\":{\"power\":%d,\"status\":\"%s\"},"
             "\"rear\":{\"power\":%d,\"status\":\"%s\"}"
             "}",
-            currentState.mpptPowers[0], currentState.mpptStatuses[0],
-            currentState.mpptPowers[1], currentState.mpptStatuses[1],
-            currentState.mpptPowers[2], currentState.mpptStatuses[2]
+            state.mpptPowers[0], state.mpptStatuses[0],
+            state.mpptPowers[1], state.mpptStatuses[1],
+            state.mpptPowers[2], state.mpptStatuses[2]
         );
     }
     
     // Add solar summary and close JSON
     if (pos < sizeof(wsBuffer) - 50) {
         snprintf(wsBuffer + pos, sizeof(wsBuffer) - pos,
-            ",\"solar\":{\"totalToday\":\"%.0f\"}}", currentState.totalToday
+            ",\"solar\":{\"totalToday\":\"%.0f\"}}", state.totalToday
         );
     }
 
@@ -1981,7 +1965,6 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
           return;
         }
 
-        // Thread-safe data updates using mutex
         if (deviceDataMutex != NULL && xSemaphoreTake(deviceDataMutex, 10 / portTICK_PERIOD_MS) == pdTRUE) {
           
           if (vicData->victronRecordType == 1) {
@@ -2061,44 +2044,47 @@ void bleScanTask(void *parameter) {
         
         vTaskDelay(100 / portTICK_PERIOD_MS);
         
+        // Yield to watchdog
         yield();
     }
     vTaskDelete(NULL); // Delete this task
 }
 
 void manageDailySession() {
-  if (sessionActive) {
-    if (currentState.totalPower < 5) { // Very low power
+  if (session.active) {
+    // Check if we should end the session
+    if (state.totalPower < 5) { // Very low power
         lowPowerCount++;
         if (lowPowerCount >= 10) {
             Serial.println("SESSION END: 10 minutes of low power - ending session");
-            sessionActive = false;
+            session.active = false;
             return; // Don't process data when session ends
         }
     } else {
         lowPowerCount = 0; // Reset when power returns
     }
     
-    if (currentDataIndex >= DATA_MINS - 1) {
+    // Check if we hit the time limit
+    if (session.index >= DATA_MINS - 1) {
         Serial.println("SESSION END: Reached maximum session length!");
-        sessionActive = false;
+        session.active = false;
         return;
     }
   }
   
   // Session management logic
-  if (!sessionActive && currentState.totalPower > 5) {
+  if (!session.active && state.totalPower > 5) {
     // Start new session - first light detected
     Serial.println("Starting new solar session - first light detected");
-    sessionActive = true;
-    currentDataIndex = 0;
+    session.active = true;
+    session.index = 0;
   }
   
-  if (sessionActive && currentDataIndex + 1 < DATA_MINS) {
-      currentDataIndex++;
+  if (session.active && session.index + 1 < DATA_MINS) {
+      session.index++;
   }
 
-  if (!newDayDetected) return;
+  if (!session.newDay) return;
   
   // Check if ALL MPPTs have reset to 0 (or are at least very low)
   bool allMpptsReset = true;
@@ -2130,7 +2116,7 @@ void manageDailySession() {
 void setup() {
     pinMode(led, OUTPUT);
     digitalWrite(led, 1);
-    runTime = 0;
+    session.runTime = 0;
     Serial.begin(115200);  
     Serial.println();
     Serial.printf("%s - Built %s\r\n", apssid, __TIMESTAMP__);
@@ -2142,6 +2128,7 @@ void setup() {
 
     heap_caps_check_integrity_all(true);
     
+    // Initialize file system FIRST
     if (!SPIFFS.begin(true)) {
         Serial.println("SPIFFS Mount Failed!");
     } else {
@@ -2189,24 +2176,24 @@ void loop() {
     if (otaEnabled) {
         ArduinoOTA.handle();
     }
+
+    if (digitalRead(button) == 0 && otaEnabled == false) {
+      enableOTA();          // Press button to Enable OTA so we can avoid it's memory issues
+    }
     
     checkMemoryHealth();
     monitorBLETask();
-
-    if (digitalRead(button) == 0 && otaEnabled == false) {
-	enableOTA();          // Press button to Enable OTA so we can avoid it's memory issues
-    }
     
     // Process console commands
     while (Serial.available()) {
         uint8_t gc = Serial.read();
         if (gc == 13) {
             printData = 1;
-        } else if (gc == 1) {  // CTRL-A
+        } else if (gc == 1) {    // CTRL-A
             reboot();
-        } else if (gc == 'o' && otaEnabled == false) {  // Enable OTA
+        } else if (gc == 'o') {  // Enable OTA
             enableOTA();
-        } else if (gc == 'w') { // WiFi status
+        } else if (gc == 'w') {  // WiFi status
             if (apModeActive) {
               Serial.printf("WiFi Status: AP Mode - %s\r\n", WiFi.softAPIP().toString().c_str());
             } else if (WiFi.isConnected()) {
@@ -2237,16 +2224,16 @@ void loop() {
     if (millis() - minTimer >= 60000) {
         minTimer = millis();
 
-        runTime++;
+        session.runTime++;
         
         manageDailySession();
 
-        Serial.printf("Up %u mins - Session: %s, Index: %d, Power: %u W, SoC: %3.0f%% - ", runTime, sessionActive ? "Active" : "Inactive",
-              currentDataIndex, currentState.totalPower, currentState.battSoc);
+        Serial.printf("Up %u mins - Session: %s, Index: %d, Power: %u W, SoC: %3.0f%% - ", session.runTime, session.active ? "Active" : "Inactive",
+              session.index, state.totalPower, state.battSoc);
         Serial.printf("Memory: Free=%d, Min=%d, WS clients=%d, Loops=%d\r\n", ESP.getFreeHeap(), minFreeHeap, ws.count(), loopCount);
         loopCount = 0;
 
-        if (sessionActive) {
+        if (session.active) {
             backupTimer++;
             if (backupTimer >= 5) {
               saveSessionDataToSPIFFS();
