@@ -15,10 +15,10 @@ const char* stssid = "YOUR-SSID";         // Primary WiFi network
 const char* stkey = "PASSWORD";           // Primary WiFi password
 const char* stssid2 = "YOUR-SSID2";       // Secondary WiFi network
 const char* stkey2 = "PASSWORD2";         // Secondary WiFi password
-const char* apssid = "ESP32-Victron";     // SSID for AP if above 2 SSIDs cannot be found
-const char* apkey = "PASSWORD";		  // Password for AP mode
 
 const char* otaPassword = "PASS";         // OTA Password
+
+const char* hostname = "ESP32-Victron";
 
 const char* mpptNames[] = {"left", "right", "rear"};
 const char* deviceNames[] = {"LEFT", "RIGHT", "REAR", "BATT"};
@@ -207,10 +207,8 @@ bool dataChangedSinceLastSave = false;
 bool dataChangedSinceLastBackup = false;
 bool otaInProgress = false;
 bool otaEnabled = false;
-bool needServerInit = false;
 bool batteryValid = false;
 bool wifiScanInProgress = false;
-bool apModeActive = false;
 bool isWifiConnected = false;
 char savedDeviceName[32];
 uint8_t backupTimer = 0;
@@ -225,6 +223,7 @@ int32_t RSSI;
 int currentSSIDIndex = -1; // -1 = none, 0 = primary, 1 = secondary
 int keyBits = 128;
 int scanTime = 1;
+int lastClientCount = 0;
 unsigned long lastWifiScan = 0;
 unsigned long wifiConnectStartTime = 0;
 unsigned long lastUpdate = 0;
@@ -239,12 +238,10 @@ void reboot() {
     vTaskDelete(bleScanTaskHandle);
     bleScanTaskHandle = NULL;
   }
-            
   vTaskDelay(100 / portTICK_PERIOD_MS);
   ESP.restart();
 }
 
-// Enhanced memory monitoring
 void checkMemoryHealth() {
     static unsigned long lastMemCheck = 0;
     static size_t lastFreeHeap = 0;
@@ -272,6 +269,7 @@ void checkMemoryHealth() {
             lowMemoryStart = now;
         } else if (now - lowMemoryStart > 300000) { // 5 minutes of low memory
             Serial.printf("WARNING: 5+ minutes of low memory condition (current: %d bytes)\r\n", freeHeap);
+            reboot();
         }
     } else {
         lowMemoryStart = 0;
@@ -343,6 +341,17 @@ void monitorBLETask() {
     }
 }
 
+void setupWiFi() {
+  Serial.println("Initializing WiFi...");
+  
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  
+  scanForWiFiNetworks();
+  
+  initializeWebServer();
+}
+
 void scanForWiFiNetworks() {
   if (wifiScanInProgress) return;
   
@@ -354,7 +363,7 @@ void scanForWiFiNetworks() {
   wifiScanInProgress = false;
   
   if (n == 0) {
-    Serial.println("No networks found");
+    Serial.println("No networks found - will retry in 30 seconds");
     return;
   }
   
@@ -370,32 +379,25 @@ void scanForWiFiNetworks() {
     Serial.printf("  %d: %s (%d dBm) %s\r\n", i, foundSSID.c_str(), rssi, 
                WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? " " : "*");
     
-    // Check if this is one of our configured networks
     for (int j = 0; j < numWifiNetworks; j++) {
       if (foundSSID == wifiNetworks[j].ssid) {
-        // Prefer networks with better signal, but prioritize primary network
         if (foundNetworkIndex == -1 || 
             (j == 0 && foundNetworkIndex != 0) || // Primary network found
             (j == foundNetworkIndex && rssi > bestRSSI)) { // Same network, better signal
           foundNetworkIndex = j;
           bestRSSI = rssi;
-          Serial.printf("  -> Found configured network: %s (index %d, RSSI: %d)\r\n", 
+          Serial.printf("  ---> Found configured network: %s (index %d, RSSI: %d)\r\n", 
                      wifiNetworks[j].ssid, j, rssi);
         }
       }
     }
   }
   
-  // If we found a preferred network and we're not already connected to it
+  // If we found a preferred network, connect to it
   if (foundNetworkIndex != -1) {
-    if (!WiFi.isConnected() || currentSSIDIndex != foundNetworkIndex) {
-      connectToWiFi(foundNetworkIndex);
-    }
+    connectToWiFi(foundNetworkIndex);
   } else {
-    Serial.println("No configured networks found");
-    if (!apModeActive) {
-      startAPMode();
-    }
+    Serial.println("No configured networks found - will retry in 30 seconds");
   }
 }
 
@@ -404,110 +406,80 @@ void connectToWiFi(int networkIndex) {
   
   Serial.printf("Attempting to connect to: %s\r\n", wifiNetworks[networkIndex].ssid);
   
-  // If we're currently in AP mode, stop it
-  if (apModeActive) {
-    Serial.println("Stopping AP mode to connect to WiFi");
-    WiFi.softAPdisconnect(true);
-    apModeActive = false;
-  }
-  
-  // Disconnect from current network if connected
   if (WiFi.isConnected()) {
     WiFi.disconnect();
     delay(100);
   }
   
-  // Set to station mode and begin connection
-  WiFi.mode(WIFI_STA);
   WiFi.begin(wifiNetworks[networkIndex].ssid, wifiNetworks[networkIndex].password);
   
   wifiConnectStartTime = millis();
   currentSSIDIndex = networkIndex;
-  isWifiConnected = false;
-}
-
-void startAPMode() {
-  if (apModeActive) return;
-  
-  Serial.println("Starting AP mode...");
-  
-  // Disconnect from any current connection
-  if (WiFi.isConnected()) {
-    WiFi.disconnect();
-  }
-  
-  // Configure and start AP
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(IPAddress(192, 168, 1, 1), IPAddress(192, 168, 1, 1), IPAddress(255, 255, 255, 0));
-  
-  if (WiFi.softAP(apssid, apkey)) {
-    apModeActive = true;
-    isWifiConnected = true; // Consider AP mode as "connected" for server init
-    needServerInit = true;
-    currentSSIDIndex = -1;
-    
-    Serial.printf("AP started successfully\r\n");
-    Serial.printf("SSID: %s\r\n", apssid);
-    Serial.printf("IP address: %s\r\n", WiFi.softAPIP().toString().c_str());
-    
-    digitalWrite(led, 0); // Turn off LED to indicate network is ready
-  } else {
-    Serial.println("Failed to start AP mode");
-    apModeActive = false;
-  }
 }
 
 void manageWiFi() {
-    static int lastConnectionState = -1; // -1=unknown, 0=disconnected, 1=connected
+    static bool lastConnectionState = false;
     unsigned long now = millis();
+    bool currentlyConnected = WiFi.isConnected();
     
-    int currentState = WiFi.isConnected() ? 1 : 0;
-    
-    // Only process state changes, not continuous checking
-    if (currentState != lastConnectionState) {
-        lastConnectionState = currentState;
+    // Handle connection state changes
+    if (currentlyConnected != lastConnectionState) {
+        lastConnectionState = currentlyConnected;
         
-        if (currentState == 1 && !isWifiConnected && currentSSIDIndex >= 0) {
+        if (currentlyConnected && !isWifiConnected) {
             // Just connected
             isWifiConnected = true;
-            needServerInit = true;
             
             Serial.printf("\r\nSuccessfully connected to: %s\r\n", wifiNetworks[currentSSIDIndex].ssid);
             Serial.printf("IP address: %s\r\n", WiFi.localIP().toString().c_str());
             Serial.printf("RSSI: %d dBm\r\n", WiFi.RSSI());
             
-            digitalWrite(led, 0);
-            return;
-        } else if (currentState == 0 && isWifiConnected && currentSSIDIndex >= 0) {
+            digitalWrite(led, 0); // Turn off LED when connected
+            
+        } else if (!currentlyConnected && isWifiConnected) {
             // Just disconnected
-            digitalWrite(led, 1);
-            Serial.printf("Lost connection to %s\r\n", wifiNetworks[currentSSIDIndex].ssid);
             isWifiConnected = false;
             currentSSIDIndex = -1;
             
+            Serial.println("WiFi connection lost - will start scanning");
+            digitalWrite(led, 1); // Turn on LED when disconnected
+            
+            // Start scanning for networks again
             scanForWiFiNetworks();
-            return;
         }
     }
     
-    // Handle connection timeout (only check if we're trying to connect)
-    if (!WiFi.isConnected() && !apModeActive && currentSSIDIndex >= 0) {
+    // Handle connection timeout (only when trying to connect)
+    if (!currentlyConnected && currentSSIDIndex >= 0) {
         if (now - wifiConnectStartTime > WIFI_CONNECT_TIMEOUT) {
-            Serial.printf("\r\nConnection to %s timed out\r\n", wifiNetworks[currentSSIDIndex].ssid);
+            Serial.printf("Connection to %s timed out\r\n", wifiNetworks[currentSSIDIndex].ssid);
             currentSSIDIndex = -1;
+            
+            // Try scanning again
+            scanForWiFiNetworks();
+        }
+    }
+    
+    // Periodic scanning when disconnected (backup in case connection drops silently)
+    if (!currentlyConnected && currentSSIDIndex == -1) {
+        if (now - lastWifiScan > WIFI_SCAN_INTERVAL) {
             scanForWiFiNetworks();
         }
     }
 }
 
-void setupWiFi() {
-  Serial.println("Initializing WiFi...");
-  
-  WiFi.mode(WIFI_STA);
-  delay(100);
-  
-  // Single scan at startup
-  scanForWiFiNetworks();
+void initializeWebServer() {
+    Serial.println("Initializing web server...");
+    
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+      request->send_P(200, "text/html", index_html);
+    });
+    server.on("/favicon.ico", HTTP_GET, handleFavicon);
+    ws.onEvent(onWsEvent);
+    server.addHandler(&ws);
+    server.begin();
+    
+    Serial.println("Web server initialized");
 }
 
 void otaProgressCallback(unsigned int progress, unsigned int total) {
@@ -516,7 +488,7 @@ void otaProgressCallback(unsigned int progress, unsigned int total) {
 
 void enableOTA() {
     ArduinoOTA.setPort(3232);
-    ArduinoOTA.setHostname(apssid);
+    ArduinoOTA.setHostname(hostname);
     ArduinoOTA.setPassword(otaPassword);
     
     ArduinoOTA.onStart([]() {
@@ -544,26 +516,6 @@ void enableOTA() {
     ArduinoOTA.begin();
     otaEnabled = true;
     Serial.println("OTA Enabled!");
-}
-
-void handleWiFiInLoop() {
-  // Handle WiFi management
-  manageWiFi();
-  
-  // Initialize web server if needed
-  if (needServerInit && (isWifiConnected || apModeActive)) {
-    Serial.println("Initializing web server...");
-    
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-      request->send_P(200, "text/html", index_html);
-    });
-    server.on("/favicon.ico", HTTP_GET, handleFavicon);
-    ws.onEvent(onWsEvent);
-    server.addHandler(&ws);
-    server.begin();
-                    
-    needServerInit = false;
-  }
 }
 
 void checkForNewDay(int deviceIndex, float currentYield) {
@@ -2119,7 +2071,7 @@ void setup() {
     session.runTime = 0;
     Serial.begin(115200);  
     Serial.println();
-    Serial.printf("%s - Built %s\r\n", apssid, __TIMESTAMP__);
+    Serial.printf("%s - Built %s\r\n", hostname, __TIMESTAMP__);
     Serial.println();
 
     // Get reset reason
@@ -2137,7 +2089,6 @@ void setup() {
     
     initializeDevices();
     setupWiFi();  
-    strcpy(savedDeviceName,"(unknown device name)");
     
     // Create mutex with error checking
     deviceDataMutex = xSemaphoreCreateMutex();
@@ -2193,19 +2144,6 @@ void loop() {
             reboot();
         } else if (gc == 'o') {  // Enable OTA
             enableOTA();
-        } else if (gc == 'w') {  // WiFi status
-            if (apModeActive) {
-              Serial.printf("WiFi Status: AP Mode - %s\r\n", WiFi.softAPIP().toString().c_str());
-            } else if (WiFi.isConnected()) {
-              Serial.printf("WiFi Status: Connected to %s - %s (RSSI: %d)\r\n", 
-                         wifiNetworks[currentSSIDIndex].ssid, 
-                         WiFi.localIP().toString().c_str(), WiFi.RSSI());
-            } else {
-              Serial.println("WiFi Status: Disconnected");
-            }
-        } else if (gc == 's') { // Force WiFi scan
-            Serial.println("Forcing WiFi scan...");
-            scanForWiFiNetworks();
         } else if (gc == 't') { // BLE task status
             Serial.printf("Main task stack: %d bytes remaining\r\n", uxTaskGetStackHighWaterMark(NULL));
             if (bleScanTaskHandle) {
@@ -2217,7 +2155,7 @@ void loop() {
         }
     }
             
-    handleWiFiInLoop();
+    manageWiFi();
     updateData();
     
     // Tasks to run every minute:
